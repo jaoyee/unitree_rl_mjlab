@@ -5,6 +5,7 @@ logger_type: tensorboard
 
 model_resume_path: logs/rsl_rl/go2_flat_rwm_offline_mixed_safety_command_coverage_200k_proprioceptive/2026-06-10_20-24-42/model_5000.pt
 dataset_path: logs/rwm_datasets/go2_flat_mixed_safety_command_coverage_200k_from1m/dataset.pt
+policy_resume_path: null
 save_path: logs/model_based/go2_flat_flashsac_rwm_proprioceptive_200k_compact/TIMESTAMP
 
 num_imagination_envs: 1024
@@ -14,6 +15,12 @@ logging_per_interaction_step: 100
 metrics_per_interaction_step: 100
 save_checkpoint_per_interaction_step: 1000
 save_replay_buffer: false
+
+trace:
+  enabled: false
+  replay_path: null
+  replay_ratio: 0.10
+  seed: ${seed}
 
 world_model:
   max_episode_length: 1000

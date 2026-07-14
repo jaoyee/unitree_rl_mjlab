@@ -424,6 +424,15 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
             device_type=self._cfg.buffer_device_type,
             obs_storage_dtype=_obs_dtype,
         )
+        # Configured only by the optional RWM-TRACE trainer path.
+        self._trace_replay_sampler = None
+        self._trace_replay_ratio = 0.0
+
+    def configure_trace_replay(self, sampler: Any, ratio: float) -> None:
+        if not 0.0 <= float(ratio) <= 1.0:
+            raise ValueError(f"TRACE replay ratio must be in [0, 1], got {ratio}.")
+        self._trace_replay_sampler = sampler
+        self._trace_replay_ratio = float(ratio)
 
     def sample_actions(
         self,
@@ -479,6 +488,16 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
     def update(self) -> dict[str, Any]:
         batch = cast(dict[str, torch.Tensor], self._replay_buffer.sample())
 
+        trace_count = 0
+        if self._trace_replay_sampler is not None and self._trace_replay_ratio > 0.0:
+            from scripts.reinforcement_learning.rwm_trace.replay import mix_trace_replay_batch
+
+            batch, trace_count = mix_trace_replay_batch(
+                batch,
+                self._trace_replay_sampler,
+                self._trace_replay_ratio,
+            )
+
         for k, v in batch.items():
             batch[k] = v.to(self._device, non_blocking=True)
 
@@ -515,6 +534,8 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
                 update_info[key] = value.item()
             elif not isinstance(value, dict):
                 update_info[key] = float(value)
+
+        update_info["trace/replay_batch_fraction"] = float(trace_count / max(len(batch["reward"]), 1))
 
         return update_info
 

@@ -30,6 +30,7 @@ from scripts.reinforcement_learning.rwm_dataset.dataset import (
     parse_collector_mix,
     sample_collector_ids,
     save_dataset_dict,
+    stack_time_key,
 )
 try:
     from scripts.reinforcement_learning.rwm_dataset.broken_go2 import apply_go2_pd_joint_strength_scales
@@ -62,6 +63,7 @@ from scripts.reinforcement_learning.rwm_flashsac.world_model_env_proprioceptive 
     PROPRIOCEPTIVE_ACTOR_OBS_DIM,
     proprioceptive_obs_t,
 )
+from scripts.reinforcement_learning.rwm_trace.simulator_reset import reset_go2_from_rwm_state
 from src.tasks.rwm_velocity.mdp.extractors import Go2RWMExtractor, make_go2_policy_obs
 
 
@@ -219,6 +221,13 @@ def _parse_args() -> argparse.Namespace:
         metavar=("MIN", "MAX"),
     )
     parser.add_argument("--headless", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--trace_reset_dataset",
+        default=None,
+        help="Optional offline dataset whose 45D states initialize fixed-length imperfect-simulator rollouts.",
+    )
+    parser.add_argument("--trace_rollout_length", type=int, default=20)
+    parser.add_argument("--trace_trajectories_per_state", type=int, default=4)
     return parser.parse_args()
 
 
@@ -829,6 +838,26 @@ def main() -> None:
     delay_min, delay_max, action_scale_min, action_scale_max = _validate_action_interface_args(args)
     dataset_obs_kind = _resolve_dataset_obs_kind(str(args.dataset_obs_kind), actor_dim=actor_dim)
     dataset_obs_dim = PROPRIOCEPTIVE_ACTOR_OBS_DIM if dataset_obs_kind == "proprioceptive" else int(dims.policy_obs_dim)
+    trace_source_states: torch.Tensor | None = None
+    trace_start_state_ids: torch.Tensor | None = None
+    if args.trace_reset_dataset:
+        if int(args.trace_rollout_length) < 1 or int(args.trace_trajectories_per_state) < 1:
+            raise ValueError("TRACE rollout length and trajectories per state must be positive.")
+        trace_source_path = resolve_repo_path(str(args.trace_reset_dataset))
+        trace_source_dataset = torch.load(trace_source_path, map_location="cpu", weights_only=False)
+        source_states = stack_time_key(trace_source_dataset, "states").reshape(-1, int(dims.state_dim)).float()
+        if source_states.shape[-1] != 45:
+            raise ValueError(f"TRACE reset dataset must contain 45D states, got {source_states.shape[-1]}.")
+        num_unique = int(np.ceil(int(args.num_envs) / int(args.trace_trajectories_per_state)))
+        generator = torch.Generator(device="cpu").manual_seed(int(args.seed) + 1701)
+        if len(source_states) >= num_unique:
+            selected_ids = torch.randperm(len(source_states), generator=generator)[:num_unique]
+        else:
+            selected_ids = torch.randint(len(source_states), (num_unique,), generator=generator)
+        trace_start_state_ids = selected_ids.repeat_interleave(int(args.trace_trajectories_per_state))[
+            : int(args.num_envs)
+        ]
+        trace_source_states = source_states[trace_start_state_ids].to(env.device)
 
     expert_agent = _maybe_load_agent(
         None if args.expert_policy_path is None else str(args.expert_policy_path),
@@ -851,7 +880,11 @@ def main() -> None:
     mode_weights = _parse_mode_weights(args.command_mode_weights, modes, env.device)
     collector_mix = parse_collector_mix(str(args.collector_mix))
     if expert_agent is None:
-        non_random = {name: weight for name, weight in collector_mix.items() if name != "random" and weight > 0.0}
+        non_random = {
+            name: weight
+            for name, weight in collector_mix.items()
+            if name != "random" and weight > 0.0
+        }
         if non_random:
             raise ValueError(f"collector_mix uses policy-based collectors {non_random}, but expert_policy_path is empty.")
     x_range = (float(args.x_range[0]), float(args.x_range[1]))
@@ -933,6 +966,14 @@ def main() -> None:
             "env_action_delay_steps": [int(delay_min), int(delay_max)],
             "dataset_action": "post_interface_env_step_action",
         },
+        "trace_candidates": {
+            "enabled": trace_source_states is not None,
+            "reset_dataset": None if args.trace_reset_dataset is None else str(args.trace_reset_dataset),
+            "rollout_length": int(args.trace_rollout_length),
+            "trajectories_per_state": int(args.trace_trajectories_per_state),
+            "reset_is_exact": False,
+            "unrecoverable_fields": ["root_position", "root_yaw", "actuator_force"],
+        },
     }
 
     builder = _new_builder(args, dims, metadata)
@@ -969,6 +1010,30 @@ def main() -> None:
     )
     command_ages = torch.zeros(int(args.num_envs), dtype=torch.long, device=env.device)
     _force_commands(env.unwrapped, commands)
+
+    trace_reset_error = torch.full(
+        (int(args.num_envs),),
+        float("nan"),
+        device=env.device,
+    )
+
+    def reset_trace_candidates() -> None:
+        nonlocal obs_dict, trace_reset_error
+        if trace_source_states is None:
+            return
+        reset_go2_from_rwm_state(
+            env.unwrapped,
+            trace_source_states,
+            torch.arange(int(args.num_envs), device=env.device),
+        )
+        reconstructed = extractor.extract_state()
+        trace_reset_error = torch.linalg.norm(
+            reconstructed[:, :33] - trace_source_states[:, :33],
+            dim=-1,
+        )
+        obs_dict = env.unwrapped.observation_manager.compute()
+
+    reset_trace_candidates()
 
     last_actions = torch.zeros(int(args.num_envs), action_dim, device=env.device)
     action_delay_history = torch.zeros(delay_max + 1, int(args.num_envs), action_dim, device=env.device)
@@ -1046,7 +1111,7 @@ def main() -> None:
         f"{metadata['target_gap']}, fixed_collector_assignment={args.fixed_collector_assignment}"
     )
 
-    for _ in tqdm.trange(total_steps, smoothing=0.1, mininterval=0.5):
+    for collection_step in tqdm.trange(total_steps, smoothing=0.1, mininterval=0.5):
         _force_commands(env.unwrapped, commands)
         transition_episode_ids = episode_ids.clone()
         transition_timesteps = timesteps.clone()
@@ -1207,8 +1272,46 @@ def main() -> None:
             episode_id=transition_episode_ids,
             timestep=transition_timesteps,
             collector_type=transition_collector_ids,
+            trace_reset_reconstruction_error=trace_reset_error,
         )
         flush_part(force=False)
+
+        trace_boundary = (
+            trace_source_states is not None
+            and (collection_step + 1) % int(args.trace_rollout_length) == 0
+        )
+        if trace_boundary:
+            reset_trace_candidates()
+            all_env_ids = torch.arange(int(args.num_envs), device=env.device)
+            new_ids = torch.arange(
+                next_episode_id,
+                next_episode_id + int(args.num_envs),
+                device=env.device,
+                dtype=torch.long,
+            )
+            next_episode_id += int(args.num_envs)
+            episode_ids = new_ids
+            timesteps.zero_()
+            returns.zero_()
+            lengths.zero_()
+            last_actions.zero_()
+            action_delay_history.zero_()
+            command_ages.zero_()
+            mode_ids = _sample_mode_ids(mode_weights, int(args.num_envs))
+            commands = _sample_commands_for_modes(
+                mode_ids,
+                modes,
+                x_range=x_range,
+                signed_x=bool(args.signed_x),
+                x_abs_range=x_abs_range,
+                y_abs_range=y_abs_range,
+                yaw_abs_range=yaw_abs_range,
+            )
+            _force_commands(env.unwrapped, commands)
+            _append_table_chunks(
+                episode_domain_chunks,
+                _episode_domain_rows(env, env_ids=all_env_ids, episode_ids=new_ids),
+            )
 
     flush_part(force=True)
     env.close()
@@ -1231,14 +1334,24 @@ def main() -> None:
                 modes[idx].name: int(count)
                 for idx, count in enumerate(mode_counts.tolist())
             },
-            "mean_reward": float(np.mean(completed_returns)) if completed_returns else float(returns.mean().item()),
-            "mean_episode_length": float(np.mean(completed_lengths)) if completed_lengths else float(lengths.float().mean().item()),
+            "mean_reward": (
+                float(np.mean(completed_returns))
+                if completed_returns
+                else float(returns.mean().item())
+            ),
+            "mean_episode_length": (
+                float(np.mean(completed_lengths))
+                if completed_lengths
+                else float(lengths.float().mean().item())
+            ),
             "completed_episode_count": int(len(completed_lengths)),
             "termination_count": int(termination_count),
             "timeout_count": int(timeout_count),
             "collection_seconds": float(time.perf_counter() - start_time),
         }
     )
+    if trace_start_state_ids is not None:
+        dataset["trace_start_state_ids"] = trace_start_state_ids.cpu().long()
     dataset["startup_domain_table"] = startup_domain_table
     dataset["episode_domain_table"] = _finish_table_chunks(episode_domain_chunks)
     dataset["metadata"]["dr_provenance_schema"] = {

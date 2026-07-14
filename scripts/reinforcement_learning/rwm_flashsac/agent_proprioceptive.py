@@ -15,7 +15,6 @@ from flash_rl.agents.flashSAC.agent import (
 )
 from flash_rl.types import NDArray, Tensor
 from scripts.reinforcement_learning.rwm_flashsac.world_model_env_proprioceptive import (
-    PROPRIOCEPTIVE_ACTOR_OBS_DIM,
     proprioceptive_obs_t,
 )
 
@@ -57,6 +56,15 @@ class FlashSACProprioceptiveAgent(FlashSACAgent):
 
     def update(self) -> dict[str, Any]:
         batch = cast(dict[str, torch.Tensor], self._replay_buffer.sample())
+        trace_count = 0
+        if self._trace_replay_sampler is not None and self._trace_replay_ratio > 0.0:
+            from scripts.reinforcement_learning.rwm_trace.replay import mix_trace_replay_batch
+
+            batch, trace_count = mix_trace_replay_batch(
+                batch,
+                self._trace_replay_sampler,
+                self._trace_replay_ratio,
+            )
         for key, value in batch.items():
             batch[key] = value.to(self._device, non_blocking=True)
 
@@ -86,6 +94,7 @@ class FlashSACProprioceptiveAgent(FlashSACAgent):
                 update_info[key] = value.item()
             elif not isinstance(value, dict):
                 update_info[key] = float(value)
+        update_info["trace/replay_batch_fraction"] = float(trace_count / max(len(batch["reward"]), 1))
         return update_info
 
 

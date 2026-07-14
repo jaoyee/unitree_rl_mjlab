@@ -33,6 +33,7 @@ from scripts.reinforcement_learning.rwm_flashsac.world_model_env import (
     FlashSACWorldModelEnvConfig,
     Go2RWMFlashSACWorldModelEnv,
 )
+from scripts.reinforcement_learning.rwm_trace.replay import TraceReplaySampler
 
 
 class ScalarLogger:
@@ -75,6 +76,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--config_path", default=None)
     parser.add_argument("--model_resume_path", default=None)
     parser.add_argument("--dataset_path", default=None)
+    parser.add_argument("--policy_resume_path", default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--num_imagination_envs", type=int, default=None)
     parser.add_argument("--num_env_steps", type=int, default=None)
@@ -90,6 +92,8 @@ def _apply_arg_overrides(cfg: Any, args: argparse.Namespace) -> Any:
         updates.append(f"model_resume_path={args.model_resume_path}")
     if args.dataset_path is not None:
         updates.append(f"dataset_path={args.dataset_path}")
+    if args.policy_resume_path is not None:
+        updates.append(f"policy_resume_path={args.policy_resume_path}")
     if args.num_imagination_envs is not None:
         updates.append(f"num_imagination_envs={args.num_imagination_envs}")
     if args.num_env_steps is not None:
@@ -177,6 +181,47 @@ def main() -> None:
 
     agent_cfg = make_flashsac_config(cfg, device=device)
     agent = create_go2_flashsac_agent(env.observation_space, env.action_space, agent_cfg)
+    policy_resume_value = OmegaConf.select(cfg, "policy_resume_path", default=None)
+    if policy_resume_value:
+        policy_resume_path = resolve_repo_path(str(policy_resume_value))
+        agent.load(str(policy_resume_path))
+        if (policy_resume_path / "replay_buffer.pt").exists():
+            agent.load_replay_buffer(str(policy_resume_path))
+
+    trace_enabled = bool(OmegaConf.select(cfg, "trace.enabled", default=False))
+    trace_sampler = None
+    trace_ratio = 0.0
+    if trace_enabled:
+        trace_path_value = OmegaConf.select(cfg, "trace.replay_path")
+        if not trace_path_value:
+            raise ValueError("trace.enabled=true requires trace.replay_path.")
+        trace_ratio = float(OmegaConf.select(cfg, "trace.replay_ratio", default=0.1))
+        trace_seed = int(OmegaConf.select(cfg, "trace.seed", default=int(cfg.seed)))
+        trace_sampler = TraceReplaySampler(resolve_repo_path(str(trace_path_value)), seed=trace_seed)
+        replay_obs_dim = int(trace_sampler.data["observation"].shape[-1])
+        env_obs_dim = int(env.single_observation_space.shape[-1])
+        if replay_obs_dim != env_obs_dim:
+            raise ValueError(
+                f"TRACE replay observation width {replay_obs_dim} does not match RWM environment width {env_obs_dim}."
+            )
+        replay_action_dim = int(trace_sampler.data["action"].shape[-1])
+        if replay_action_dim != policy_action_dim:
+            raise ValueError(
+                f"TRACE replay action width {replay_action_dim} does not match policy width {policy_action_dim}."
+            )
+        replay_n_step = trace_sampler.metadata.get("n_step")
+        if replay_n_step is None or int(replay_n_step) != int(agent_cfg.n_step):
+            raise ValueError(
+                "TRACE replay n_step must match the FlashSAC replay configuration: "
+                f"artifact={replay_n_step}, policy={agent_cfg.n_step}."
+            )
+        replay_gamma = trace_sampler.metadata.get("gamma")
+        if replay_gamma is None or not np.isclose(float(replay_gamma), float(agent_cfg.gamma)):
+            raise ValueError(
+                "TRACE replay gamma must match the FlashSAC replay configuration: "
+                f"artifact={replay_gamma}, policy={agent_cfg.gamma}."
+            )
+        agent.configure_trace_replay(trace_sampler, trace_ratio)
 
     save_path = str(cfg.save_path).replace("TIMESTAMP", datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
     save_root = resolve_repo_path(save_path)
@@ -188,7 +233,11 @@ def main() -> None:
     total_interaction_steps = max(1, int(int(cfg.num_env_steps) // num_envs))
     update_counter = 0.0
     observations, _ = env.reset(seed=int(cfg.seed))
-    transition: dict[str, Any] | None = None
+    transition: dict[str, Any] | None = (
+        {"next_observation": observations}
+        if policy_resume_value
+        else None
+    )
     collection_time_acc = 0.0
     learning_time_acc = 0.0
     env_steps_since_log = 0
@@ -198,17 +247,23 @@ def main() -> None:
     print(f"[Go2-FlashSAC-RWM] save_root={save_root}")
     print(f"[Go2-FlashSAC-RWM] device={device}, num_envs={num_envs}, interaction_steps={total_interaction_steps}")
     print(f"[Go2-FlashSAC-RWM] full_action_dim={env.full_action_dim}, policy_action_dim={policy_action_dim}")
+    print(f"[Go2-FlashSAC-RWM] policy_resume_path={policy_resume_value}")
     print(
         "[Go2-FlashSAC-RWM] "
         f"policy_action_mask_indices={list(wm_cfg.policy_action_mask_indices)}, "
         f"world_model_action_mask_indices={list(wm_cfg.world_model_action_mask_indices)}, "
         f"policy_observation_mask_indices={list(wm_cfg.policy_observation_mask_indices)}"
     )
+    print(
+        "[Go2-FlashSAC-RWM] "
+        f"trace_enabled={trace_enabled}, trace_replay_ratio={trace_ratio}, "
+        f"trace_transitions={trace_sampler.num_transitions if trace_sampler is not None else 0}"
+    )
 
     for interaction_step in tqdm.tqdm(range(1, total_interaction_steps + 1), smoothing=0.1, mininterval=0.5):
         env_step = interaction_step * num_envs
         start = time.perf_counter()
-        if agent.can_start_training() and transition is not None:
+        if (agent.can_start_training() or policy_resume_value) and transition is not None:
             actions = agent.sample_actions(interaction_step, prev_transition=transition, training=True)
         else:
             actions = np.random.uniform(-1.0, 1.0, size=(num_envs, policy_action_dim)).astype(np.float32)
@@ -265,6 +320,7 @@ def main() -> None:
                     "Imagination/epistemic_uncertainty",
                     "Imagination/track_linear_velocity",
                     "Imagination/action_rate_l2",
+                    "trace/replay_batch_fraction",
                     "Perf/total_fps",
                 )
                 if k in logged
@@ -274,7 +330,10 @@ def main() -> None:
             learning_time_acc = 0.0
             env_steps_since_log = 0
 
-        if int(cfg.save_checkpoint_per_interaction_step) and interaction_step % int(cfg.save_checkpoint_per_interaction_step) == 0:
+        if (
+            int(cfg.save_checkpoint_per_interaction_step)
+            and interaction_step % int(cfg.save_checkpoint_per_interaction_step) == 0
+        ):
             _save_checkpoint(
                 agent,
                 save_root / f"step{interaction_step}",

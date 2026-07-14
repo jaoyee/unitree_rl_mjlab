@@ -105,6 +105,8 @@ class Go2MixedDatasetBuilder:
             "noisy_actor_observations": [],
             "metadata": dict(metadata),
         }
+        if bool((metadata.get("trace_candidates") or {}).get("enabled", False)):
+            self.data["trace_reset_reconstruction_errors"] = []
 
     @property
     def num_time_steps(self) -> int:
@@ -136,6 +138,7 @@ class Go2MixedDatasetBuilder:
         env_action_delay_step: torch.Tensor | None = None,
         actuator_delay_substep: torch.Tensor | None = None,
         noisy_actor_observation: torch.Tensor | None = None,
+        trace_reset_reconstruction_error: torch.Tensor | None = None,
     ) -> None:
         self.data["observations"].append(_detach_cpu(obs, torch.float32))
         self.data["next_observations"].append(_detach_cpu(next_obs, torch.float32))
@@ -167,6 +170,16 @@ class Go2MixedDatasetBuilder:
         self.data["noisy_actor_observations"].append(
             _detach_cpu(noisy_actor_observation, torch.float32)
         )
+        if "trace_reset_reconstruction_errors" in self.data:
+            if trace_reset_reconstruction_error is None:
+                trace_reset_reconstruction_error = torch.full(
+                    (num_envs,),
+                    float("nan"),
+                    device=action.device,
+                )
+            self.data["trace_reset_reconstruction_errors"].append(
+                _detach_cpu(trace_reset_reconstruction_error, torch.float32)
+            )
 
     def save(self, path: str | Path) -> None:
         path = Path(path)

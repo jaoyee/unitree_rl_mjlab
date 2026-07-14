@@ -32,6 +32,18 @@ world_model:
   world_model_action_mask_indices: []
   policy_observation_mask_indices: []
   broken_joint_names: []
+  interface_action_noise_std: 0.0
+  interface_action_bias_std: 0.0
+  interface_action_scale_min: 1.0
+  interface_action_scale_max: 1.0
+  interface_action_delay_steps_min: 0
+  interface_action_delay_steps_max: 0
+  interface_obs_noise_profile: none
+  interface_obs_noise_scale: 1.0
+  interface_obs_joint_pos_bias_min: 0.0
+  interface_obs_joint_pos_bias_max: 0.0
+  interface_obs_noise_std: 0.0
+  interface_obs_bias_std: 0.0
 
 agent:
   seed: ${seed}

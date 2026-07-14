@@ -76,6 +76,7 @@ class SequenceReplayBuffer:
         self.next_states: list[torch.Tensor] = []
         self.contacts: list[torch.Tensor] = []
         self.terminations: list[torch.Tensor] = []
+        self._stack_cache: dict[str, torch.Tensor] = {}
 
     def __len__(self) -> int:
         return len(self.states) * self.num_envs
@@ -106,22 +107,30 @@ class SequenceReplayBuffer:
             del self.next_states[:overflow]
             del self.contacts[:overflow]
             del self.terminations[:overflow]
+        self._stack_cache.clear()
 
     def can_sample(self, history_horizon: int, forecast_horizon: int, min_transitions: int) -> bool:
         return len(self) >= min_transitions and self.num_time_steps >= history_horizon + forecast_horizon
 
-    def _stack(self, values: list[torch.Tensor]) -> torch.Tensor:
-        return torch.stack(values, dim=0)
+    def _stack(self, values: list[torch.Tensor], cache_key: str | None = None) -> torch.Tensor:
+        if cache_key is not None:
+            cached = self._stack_cache.get(cache_key)
+            if cached is not None:
+                return cached
+        stacked = torch.stack(values, dim=0)
+        if cache_key is not None:
+            self._stack_cache[cache_key] = stacked
+        return stacked
 
     def stats(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         states = torch.cat(
             [
-                self._stack(self.states).reshape(-1, self.state_dim),
-                self._stack(self.next_states).reshape(-1, self.state_dim),
+                self._stack(self.states, "states").reshape(-1, self.state_dim),
+                self._stack(self.next_states, "next_states").reshape(-1, self.state_dim),
             ],
             dim=0,
         )
-        actions = self._stack(self.actions).reshape(-1, self.action_dim)
+        actions = self._stack(self.actions, "actions").reshape(-1, self.action_dim)
         state_mean = states.mean(dim=0)
         state_std = states.std(dim=0).clamp_min(1e-6)
         action_mean = actions.mean(dim=0)
@@ -140,11 +149,11 @@ class SequenceReplayBuffer:
         if self.num_time_steps < seq_len:
             raise RuntimeError("Not enough transitions to sample a sequence window.")
 
-        states = self._stack(self.states)
-        actions = self._stack(self.actions)
-        next_states = self._stack(self.next_states)
-        contacts = self._stack(self.contacts)
-        terms = self._stack(self.terminations)
+        states = self._stack(self.states, "states")
+        actions = self._stack(self.actions, "actions")
+        next_states = self._stack(self.next_states, "next_states")
+        contacts = self._stack(self.contacts, "contacts")
+        terms = self._stack(self.terminations, "terminations")
 
         sampled: list[tuple[int, int]] = []
         max_start = self.num_time_steps - seq_len
@@ -241,6 +250,7 @@ class SequenceReplayBuffer:
         buffer.next_states = state["next_states"]
         buffer.contacts = state["contacts"]
         buffer.terminations = state["terminations"]
+        buffer._stack_cache.clear()
         return buffer
 
     def save(self, path: str | Path) -> None:

@@ -23,6 +23,7 @@ system_dynamics:
   full_action_dim: 12
   dropped_state_indices: [0, 1, 2]
   output_dropped_state_indices: []
+  state_loss_ignored_indices: []
   dropped_action_indices: []
   ensemble_size: 5
   history_horizon: 32

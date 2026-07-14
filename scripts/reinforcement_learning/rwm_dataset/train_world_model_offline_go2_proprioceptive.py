@@ -71,6 +71,10 @@ def main() -> None:
         cfg.system_dynamics.get("output_dropped_state_indices", []),
         action_dim=45,
     )
+    state_loss_ignored_indices = normalize_action_mask_indices(
+        cfg.system_dynamics.get("state_loss_ignored_indices", []),
+        action_dim=45,
+    )
     input_dropped_state_indices = tuple(
         sorted(set(GO2_BASE_LIN_VEL_STATE_INDICES) | set(configured_input_drop) | set(masked_state_indices))
     )
@@ -96,6 +100,12 @@ def main() -> None:
         cfg,
         "system_dynamics.output_dropped_state_indices",
         list(output_dropped_state_indices),
+        merge=True,
+    )
+    OmegaConf.update(
+        cfg,
+        "system_dynamics.state_loss_ignored_indices",
+        list(state_loss_ignored_indices),
         merge=True,
     )
     OmegaConf.update(cfg, "system_dynamics.dropped_action_indices", list(action_mask_indices_cfg), merge=True)
@@ -158,6 +168,7 @@ def main() -> None:
         loss_mode=str(cfg.system_dynamics.get("loss_mode", "reference_autoregressive_mse")),
         dropped_state_indices=tuple(input_dropped_state_indices),
         output_dropped_state_indices=tuple(output_dropped_state_indices),
+        state_loss_ignored_indices=tuple(state_loss_ignored_indices),
         dropped_action_indices=tuple(action_mask_indices),
     )
     dynamics = ProprioceptiveSystemDynamicsEnsemble(dynamics_cfg).to(device)
@@ -187,7 +198,8 @@ def main() -> None:
     print(
         "[Go2-OfflineRWM-Proprioceptive] model output: "
         f"state_dim={dynamics_cfg.output_state_dim}, "
-        f"output_dropped_state_indices={list(output_dropped_state_indices)}, contact, termination"
+        f"output_dropped_state_indices={list(output_dropped_state_indices)}, "
+        f"state_loss_ignored_indices={list(state_loss_ignored_indices)}, contact, termination"
     )
     print(f"[Go2-OfflineRWM-Proprioceptive] device={device}, transitions={sampler.num_transitions}")
     print(f"[Go2-OfflineRWM-Proprioceptive] train_sequences={sampler.train_indices.shape[0]}, val_sequences={sampler.val_indices.shape[0]}")
@@ -282,6 +294,7 @@ def main() -> None:
                     "masked_joint_names": list(masked_joint_names),
                     "dropped_state_indices": list(input_dropped_state_indices),
                     "output_dropped_state_indices": list(output_dropped_state_indices),
+                    "state_loss_ignored_indices": list(state_loss_ignored_indices),
                     "dropped_action_indices": list(action_mask_indices),
                     "policy_observation_mask_indices": list(policy_observation_mask_indices),
                     "metrics": dict(latest_metrics),
@@ -305,6 +318,7 @@ def main() -> None:
             "masked_joint_names": list(masked_joint_names),
             "dropped_state_indices": list(input_dropped_state_indices),
             "output_dropped_state_indices": list(output_dropped_state_indices),
+            "state_loss_ignored_indices": list(state_loss_ignored_indices),
             "dropped_action_indices": list(action_mask_indices),
             "policy_observation_mask_indices": list(policy_observation_mask_indices),
             "metrics": dict(latest_metrics),

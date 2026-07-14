@@ -23,6 +23,43 @@ from src.tasks.rwm_velocity.mdp.rewards import (
 )
 
 
+_INTERFACE_OBS_NOISE_PROFILES = {
+    "none",
+    "friend",
+    "legacy_friend",
+    "deployment_small",
+}
+
+
+def interface_observation_noise_half_range(
+    profile: str,
+    *,
+    device: torch.device | str,
+) -> torch.Tensor:
+    """Return unscaled uniform half-ranges in the 48D RWM observation order."""
+
+    normalized = str(profile or "none").lower()
+    if normalized not in _INTERFACE_OBS_NOISE_PROFILES:
+        raise ValueError(f"Unknown interface observation noise profile: {profile!r}")
+
+    half_range = torch.zeros(48, device=device)
+    if normalized == "friend":
+        # Exact sensor-noise ranges from wty-yy/go2_rl_gym@vanilla_train.
+        half_range[3:6] = 0.2
+        half_range[6:9] = 0.05
+        half_range[12:24] = 0.01
+        half_range[24:36] = 1.5
+    elif normalized in {"legacy_friend", "deployment_small"}:
+        # legacy_friend preserves the previously shipped RWM-interface mapping.
+        # deployment_small intentionally reuses those small base ranges as a
+        # separate, explicit profile for the first normal-Go2 factorial screen.
+        half_range[3:6] = 0.05
+        half_range[6:9] = 0.05
+        half_range[12:24] = 0.01
+        half_range[24:36] = 0.075
+    return half_range
+
+
 @dataclass
 class FlashSACWorldModelEnvConfig:
     num_envs: int = 4096
@@ -42,6 +79,19 @@ class FlashSACWorldModelEnvConfig:
     world_model_action_mask_indices: tuple[int, ...] = ()
     policy_observation_mask_indices: tuple[int, ...] = ()
     broken_joint_names: tuple[str, ...] = ()
+    interface_action_noise_std: float = 0.0
+    interface_action_bias_std: float = 0.0
+    interface_action_scale_min: float = 1.0
+    interface_action_scale_max: float = 1.0
+    interface_action_delay_steps_min: int = 0
+    interface_action_delay_steps_max: int = 0
+    interface_obs_noise_profile: str = "none"
+    interface_obs_noise_scale: float = 1.0
+    interface_obs_joint_pos_bias_min: float = 0.0
+    interface_obs_joint_pos_bias_max: float = 0.0
+    # Legacy isotropic knobs. Formal DR runs leave these at zero.
+    interface_obs_noise_std: float = 0.0
+    interface_obs_bias_std: float = 0.0
 
 
 class Go2RWMFlashSACWorldModelEnv(VectorEnv):
@@ -92,6 +142,27 @@ class Go2RWMFlashSACWorldModelEnv(VectorEnv):
             dtype=torch.long,
             device=self._device,
         )
+        self._interface_action_delay_min = int(cfg.interface_action_delay_steps_min)
+        self._interface_action_delay_max = int(cfg.interface_action_delay_steps_max)
+        if self._interface_action_delay_min < 0 or self._interface_action_delay_max < self._interface_action_delay_min:
+            raise ValueError(
+                "Invalid interface action delay range: "
+                f"{self._interface_action_delay_min}, {self._interface_action_delay_max}"
+            )
+        if float(cfg.interface_action_scale_min) <= 0.0 or float(cfg.interface_action_scale_max) < float(
+            cfg.interface_action_scale_min
+        ):
+            raise ValueError(
+                "Invalid interface action scale range: "
+                f"{cfg.interface_action_scale_min}, {cfg.interface_action_scale_max}"
+            )
+        self._interface_obs_noise_profile = str(cfg.interface_obs_noise_profile or "none").lower()
+        if self._interface_obs_noise_profile not in _INTERFACE_OBS_NOISE_PROFILES:
+            raise ValueError(f"Unknown interface observation noise profile: {cfg.interface_obs_noise_profile!r}")
+        if float(cfg.interface_obs_noise_scale) < 0.0:
+            raise ValueError("interface_obs_noise_scale must be non-negative.")
+        if float(cfg.interface_obs_joint_pos_bias_max) < float(cfg.interface_obs_joint_pos_bias_min):
+            raise ValueError("Invalid interface joint-position bias range.")
         self.single_observation_space = gym.spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -125,6 +196,11 @@ class Go2RWMFlashSACWorldModelEnv(VectorEnv):
         self._reward_buffer: deque[float] = deque(maxlen=100)
         self._length_buffer: deque[float] = deque(maxlen=100)
         self._latest_log: dict[str, float] = {}
+        self._interface_action_history: torch.Tensor
+        self._interface_action_scale: torch.Tensor
+        self._interface_action_bias: torch.Tensor
+        self._interface_obs_bias: torch.Tensor
+        self._interface_obs_noise_half_range = self._make_interface_obs_noise_half_range()
         self._reset_all()
 
     @property
@@ -162,6 +238,95 @@ class Go2RWMFlashSACWorldModelEnv(VectorEnv):
         if self._full_action_zero_indices_t.numel() > 0:
             actions[..., self._full_action_zero_indices_t] = 0.0
         return actions
+
+    def _sample_interface_action_scale(self, count: int) -> torch.Tensor:
+        lo = float(self.cfg.interface_action_scale_min)
+        hi = float(self.cfg.interface_action_scale_max)
+        if lo == 1.0 and hi == 1.0:
+            return torch.ones(count, self._full_action_dim, device=self._device)
+        return torch.empty(count, self._full_action_dim, device=self._device).uniform_(lo, hi)
+
+    def _sample_interface_action_bias(self, count: int) -> torch.Tensor:
+        std = float(self.cfg.interface_action_bias_std)
+        if std <= 0.0:
+            return torch.zeros(count, self._full_action_dim, device=self._device)
+        return torch.randn(count, self._full_action_dim, device=self._device) * std
+
+    def _make_interface_obs_noise_half_range(self) -> torch.Tensor:
+        # Full RWM observation layout:
+        # [base_lin_vel, base_ang_vel, gravity, command, joint_pos,
+        #  joint_vel, previous_action]. Commands, previous actions, and the
+        # privileged base linear velocity remain clean.
+        full_range = interface_observation_noise_half_range(
+            self._interface_obs_noise_profile,
+            device=self._device,
+        )
+        return mask_tensor_features_t(
+            full_range.unsqueeze(0),
+            self._policy_observation_mask_indices,
+        ).squeeze(0)
+
+    def _sample_interface_obs_bias(self, count: int) -> torch.Tensor:
+        full_bias = torch.zeros(count, self._full_obs_dim, device=self._device)
+        if self._interface_obs_noise_profile in {"friend", "legacy_friend"}:
+            lo = float(self.cfg.interface_obs_joint_pos_bias_min)
+            hi = float(self.cfg.interface_obs_joint_pos_bias_max)
+            if lo != 0.0 or hi != 0.0:
+                full_bias[:, 12:24] = torch.empty(count, 12, device=self._device).uniform_(lo, hi)
+        bias = mask_tensor_features_t(full_bias, self._policy_observation_mask_indices)
+        legacy_std = float(self.cfg.interface_obs_bias_std)
+        if legacy_std > 0.0:
+            bias = bias + torch.randn_like(bias) * legacy_std
+        return bias
+
+    def _reset_interface_randomization_all(self) -> None:
+        history_len = self._interface_action_delay_max + 1
+        latest_action = self.action_history[:, -1]
+        self._interface_action_history = latest_action.unsqueeze(0).repeat(history_len, 1, 1).clone()
+        self._interface_action_scale = self._sample_interface_action_scale(self.num_envs)
+        self._interface_action_bias = self._sample_interface_action_bias(self.num_envs)
+        self._interface_obs_bias = self._sample_interface_obs_bias(self.num_envs)
+
+    def _reset_interface_randomization_idx(self, env_ids: torch.Tensor) -> None:
+        if len(env_ids) == 0:
+            return
+        self._interface_action_history[:, env_ids] = self.action_history[env_ids, -1].unsqueeze(0).repeat(
+            self._interface_action_delay_max + 1,
+            1,
+            1,
+        )
+        self._interface_action_scale[env_ids] = self._sample_interface_action_scale(len(env_ids))
+        self._interface_action_bias[env_ids] = self._sample_interface_action_bias(len(env_ids))
+        self._interface_obs_bias[env_ids] = self._sample_interface_obs_bias(len(env_ids))
+
+    def _apply_interface_action_dr(self, actions: torch.Tensor) -> torch.Tensor:
+        actual = actions * self._interface_action_scale + self._interface_action_bias
+        if float(self.cfg.interface_action_noise_std) > 0.0:
+            actual = actual + float(self.cfg.interface_action_noise_std) * torch.randn_like(actual)
+        actual = torch.clamp(actual, -1.0, 1.0)
+        if self._interface_action_delay_max <= 0:
+            return self._apply_full_action_zero_mask(actual)
+
+        self._interface_action_history[:-1].copy_(self._interface_action_history[1:].clone())
+        self._interface_action_history[-1].copy_(actual)
+        delays = torch.randint(
+            self._interface_action_delay_min,
+            self._interface_action_delay_max + 1,
+            (actions.shape[0],),
+            device=self._device,
+        )
+        env_ids = torch.arange(actions.shape[0], device=self._device)
+        delayed = self._interface_action_history[self._interface_action_delay_max - delays, env_ids].clone()
+        return self._apply_full_action_zero_mask(delayed)
+
+    def _apply_interface_obs_dr(self, observations: torch.Tensor) -> torch.Tensor:
+        obs = observations + self._interface_obs_bias
+        if self._interface_obs_noise_profile != "none" and float(self.cfg.interface_obs_noise_scale) > 0.0:
+            noise = torch.empty_like(obs).uniform_(-1.0, 1.0)
+            obs = obs + noise * self._interface_obs_noise_half_range * float(self.cfg.interface_obs_noise_scale)
+        if float(self.cfg.interface_obs_noise_std) > 0.0:
+            obs = obs + float(self.cfg.interface_obs_noise_std) * torch.randn_like(obs)
+        return obs
 
     def _expand_policy_actions(self, actions: torch.Tensor) -> torch.Tensor:
         if actions.shape[-1] != self._policy_action_dim:
@@ -204,6 +369,7 @@ class Go2RWMFlashSACWorldModelEnv(VectorEnv):
         self._sample_commands(env_ids)
         self.reward_state.last_joint_vel = self.state_history[:, -1, 21:33].clone()
         self.reward_state.last_action = self.action_history[:, -1].clone()
+        self._reset_interface_randomization_all()
         self._ep_returns.zero_()
         self._ep_lengths.zero_()
 
@@ -221,13 +387,14 @@ class Go2RWMFlashSACWorldModelEnv(VectorEnv):
         self._sample_commands(env_ids)
         self.reward_state.last_joint_vel[env_ids] = self.state_history[env_ids, -1, 21:33]
         self.reward_state.last_action[env_ids] = self.action_history[env_ids, -1]
+        self._reset_interface_randomization_idx(env_ids)
 
     def _current_obs_t(self) -> torch.Tensor:
         full_obs = make_go2_policy_obs(self.state_history[:, -1], self.command, self.action_history[:, -1])
         return mask_tensor_features_t(full_obs, self._policy_observation_mask_indices)
 
     def _current_obs_np(self) -> np.ndarray:
-        return self._current_obs_t().detach().cpu().numpy().astype(np.float32)
+        return self._apply_interface_obs_dr(self._current_obs_t()).detach().cpu().numpy().astype(np.float32)
 
     def reset(
         self,
@@ -256,7 +423,8 @@ class Go2RWMFlashSACWorldModelEnv(VectorEnv):
             policy_action_t = torch.from_numpy(actions).to(self._device).float()
         else:
             policy_action_t = actions.to(self._device).float()
-        action_t = self._expand_policy_actions(policy_action_t)
+        action_command_t = self._expand_policy_actions(policy_action_t)
+        action_t = self._apply_interface_action_dr(action_command_t)
 
         self.action_history = torch.cat([self.action_history[:, 1:], action_t.unsqueeze(1)], dim=1)
         with torch.no_grad():
@@ -288,6 +456,12 @@ class Go2RWMFlashSACWorldModelEnv(VectorEnv):
         terminated = predicted_done | bad_orientation
         truncated = time_outs
         dones = terminated | truncated
+        final_obs = self._apply_interface_obs_dr(
+            mask_tensor_features_t(
+                final_obs_t,
+                self._policy_observation_mask_indices,
+            )
+        ).detach().cpu().numpy().astype(np.float32)
 
         resample_ids = (self.episode_length_buf % self.command_intervals == 0).nonzero(as_tuple=False).squeeze(-1)
         self._sample_commands(resample_ids)
@@ -305,12 +479,14 @@ class Go2RWMFlashSACWorldModelEnv(VectorEnv):
             "Imagination/predicted_done": float(predicted_done.float().mean().detach().cpu()),
             "Imagination/bad_orientation": float(bad_orientation.float().mean().detach().cpu()),
             "Imagination/num_valid_imagination_envs": float((~dones).float().sum().detach().cpu()),
+            "Imagination/interface_action_delta_abs": float(
+                torch.abs(action_t - action_command_t).mean().detach().cpu()
+            ),
         }
         for key, value in reward_terms.items():
             self._latest_log[f"Imagination/{key}"] = float(value.mean().detach().cpu())
 
         next_obs = self._current_obs_np()
-        final_obs = final_obs_t.detach().cpu().numpy().astype(np.float32)
         infos = {
             "final_obs": final_obs,
             "episode_info": self._episode_info(),

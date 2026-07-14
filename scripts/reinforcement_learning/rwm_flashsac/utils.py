@@ -174,3 +174,9 @@ def configure_low_thread_env() -> None:
     os.environ.setdefault("OMP_NUM_THREADS", "2")
     os.environ.setdefault("MKL_NUM_THREADS", "2")
     os.environ.setdefault("NUMEXPR_NUM_THREADS", "2")
+    torch.set_num_threads(int(os.environ["OMP_NUM_THREADS"]))
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        # PyTorch only permits changing the inter-op pool before it is used.
+        pass

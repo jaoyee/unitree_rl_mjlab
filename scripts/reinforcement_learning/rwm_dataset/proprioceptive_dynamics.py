@@ -49,6 +49,7 @@ class ProprioceptiveDynamicsConfig:
     loss_mode: str = "reference_autoregressive_mse"
     dropped_state_indices: tuple[int, ...] = (0, 1, 2)
     output_dropped_state_indices: tuple[int, ...] = ()
+    state_loss_ignored_indices: tuple[int, ...] = ()
     dropped_action_indices: tuple[int, ...] = ()
 
 
@@ -134,6 +135,7 @@ class ProprioceptiveSystemDynamicsEnsemble(nn.Module):
         input_state_indices = indices_to_keep(cfg.dropped_state_indices, dim=cfg.full_state_dim)
         output_state_indices = indices_to_keep(cfg.output_dropped_state_indices, dim=cfg.full_state_dim)
         action_indices = indices_to_keep(cfg.dropped_action_indices, dim=cfg.full_action_dim)
+        state_loss_ignored_indices = tuple(sorted(set(int(idx) for idx in cfg.state_loss_ignored_indices)))
         if len(input_state_indices) != int(cfg.input_state_dim):
             raise ValueError(
                 f"input_state_dim={cfg.input_state_dim} does not match kept input state dims "
@@ -149,12 +151,39 @@ class ProprioceptiveSystemDynamicsEnsemble(nn.Module):
                 f"action_dim={cfg.action_dim} does not match kept action dims "
                 f"{len(action_indices)} from dropped_action_indices={cfg.dropped_action_indices}."
             )
+        invalid_loss_indices = [
+            idx for idx in state_loss_ignored_indices if idx < 0 or idx >= int(cfg.full_state_dim)
+        ]
+        if invalid_loss_indices:
+            raise ValueError(
+                f"state_loss_ignored_indices contains out-of-range indices {invalid_loss_indices} "
+                f"for full_state_dim={cfg.full_state_dim}."
+            )
+        ignored_not_in_output = sorted(set(state_loss_ignored_indices) - set(output_state_indices))
+        if ignored_not_in_output:
+            raise ValueError(
+                "state_loss_ignored_indices must refer to dimensions retained in the 45-d output; "
+                f"not present: {ignored_not_in_output}."
+            )
         self._input_state_indices = input_state_indices
         self._output_state_indices = output_state_indices
         self._action_indices = action_indices
         self.register_buffer("input_state_indices_t", torch.tensor(input_state_indices, dtype=torch.long))
         self.register_buffer("output_state_indices_t", torch.tensor(output_state_indices, dtype=torch.long))
         self.register_buffer("action_indices_t", torch.tensor(action_indices, dtype=torch.long))
+        state_loss_weights = torch.ones(cfg.output_state_dim, dtype=torch.float32)
+        ignored_output_positions = [
+            output_state_indices.index(full_idx) for full_idx in state_loss_ignored_indices
+        ]
+        if ignored_output_positions:
+            state_loss_weights[ignored_output_positions] = 0.0
+            active_dims = int(torch.count_nonzero(state_loss_weights).item())
+            if active_dims == 0:
+                raise ValueError("state_loss_ignored_indices cannot disable every output dimension.")
+            # Preserve the original summed-loss scale so the ablation changes
+            # supervision content without also reducing the optimizer signal.
+            state_loss_weights *= float(cfg.output_state_dim) / float(active_dims)
+        self.register_buffer("state_loss_weights", state_loss_weights)
         self.members = nn.ModuleList([_ProprioceptiveDynamicsMember(cfg) for _ in range(cfg.ensemble_size)])
         self.register_buffer("input_state_mean", torch.zeros(cfg.input_state_dim))
         self.register_buffer("input_state_std", torch.ones(cfg.input_state_dim))
@@ -351,7 +380,11 @@ class ProprioceptiveSystemDynamicsEnsemble(nn.Module):
                 target_idx = h + forecast_idx - 1
                 target = self.normalize_output_state(ns[:, target_idx])
                 pred_sample = torch.randn_like(mean) * torch.exp(logstd) + mean
-                state_loss_member = state_loss_member + torch.sum((pred_sample - target).square(), dim=-1).mean()
+                squared_error = (pred_sample - target).square()
+                state_loss_member = state_loss_member + torch.sum(
+                    squared_error * self.state_loss_weights,
+                    dim=-1,
+                ).mean()
                 bound_loss_member = bound_loss_member + self._compute_bound_loss(raw_logstd)
                 contact_loss_member = contact_loss_member + F.binary_cross_entropy_with_logits(
                     contact_logits,
@@ -471,7 +504,12 @@ def load_proprioceptive_dynamics_checkpoint(
         raise ValueError(
             f"Checkpoint {path} does not contain infos['proprioceptive_dynamics_config']."
         )
-    for key in ("dropped_state_indices", "output_dropped_state_indices", "dropped_action_indices"):
+    for key in (
+        "dropped_state_indices",
+        "output_dropped_state_indices",
+        "state_loss_ignored_indices",
+        "dropped_action_indices",
+    ):
         if isinstance(cfg_dict.get(key), list):
             cfg_dict[key] = tuple(cfg_dict[key])
     cfg = ProprioceptiveDynamicsConfig(**cfg_dict)

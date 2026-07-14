@@ -23,6 +23,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from scripts.reinforcement_learning.rwm_dataset.dataset import (  # noqa: E402
     COLLECTOR_ID_TO_NAME,
+    COLLECTOR_NAME_TO_ID,
     load_mixed_dataset,
     save_dataset_dict,
 )
@@ -54,6 +55,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--num_trajectories", type=int, default=25)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--selection", choices=("stratified", "random", "first"), default="stratified")
+    parser.add_argument(
+        "--collector",
+        choices=tuple(sorted(COLLECTOR_NAME_TO_ID)),
+        default=None,
+        help="Require every transition in each selected env column to use this collector.",
+    )
     return parser.parse_args()
 
 
@@ -85,11 +92,31 @@ def _allocate_counts(global_counts: Counter[int], total: int) -> dict[int, int]:
     return alloc
 
 
-def _select_env_ids(dataset: dict[str, Any], num_trajectories: int, seed: int, selection: str) -> torch.Tensor:
+def _select_env_ids(
+    dataset: dict[str, Any],
+    num_trajectories: int,
+    seed: int,
+    selection: str,
+    collector_name: str | None,
+) -> torch.Tensor:
     num_envs = int(dataset["num_envs"])
     if num_trajectories <= 0 or num_trajectories > num_envs:
         raise ValueError(f"num_trajectories must be in [1, {num_envs}], got {num_trajectories}.")
     generator = torch.Generator().manual_seed(int(seed))
+    if collector_name is not None:
+        collector = _stack_key(dataset, "collector_types").long()
+        collector_id = COLLECTOR_NAME_TO_ID[collector_name]
+        eligible = (collector == collector_id).all(dim=0).nonzero(as_tuple=False).flatten()
+        if eligible.numel() < num_trajectories:
+            raise ValueError(
+                f"Need {num_trajectories} pure {collector_name!r} trajectories, "
+                f"but only {eligible.numel()} env columns are eligible. "
+                "Collect with --fixed_collector_assignment."
+            )
+        if selection == "first":
+            return eligible[:num_trajectories]
+        perm = torch.randperm(eligible.numel(), generator=generator)
+        return eligible[perm[:num_trajectories]].sort().values
     if selection == "first":
         return torch.arange(num_trajectories, dtype=torch.long)
     if selection == "random":
@@ -134,7 +161,13 @@ def main() -> None:
         save_path = REPO_ROOT / save_path
 
     dataset = load_mixed_dataset(source_path)
-    env_ids = _select_env_ids(dataset, int(args.num_trajectories), int(args.seed), str(args.selection))
+    env_ids = _select_env_ids(
+        dataset,
+        int(args.num_trajectories),
+        int(args.seed),
+        str(args.selection),
+        args.collector,
+    )
     sliced: dict[str, Any] = {}
     for key, value in dataset.items():
         if key in TIME_MAJOR_KEYS:
@@ -153,6 +186,7 @@ def main() -> None:
             "seed": int(args.seed),
             "selected_env_ids": env_ids.tolist(),
             "num_trajectories": num_envs,
+            "required_collector": args.collector,
             "num_time_steps": num_time_steps,
             "num_transitions": num_time_steps * num_envs,
             "actual_num_transitions": num_time_steps * num_envs,
@@ -166,6 +200,11 @@ def main() -> None:
     modes = _env_collector_modes(sliced)
     mode_counts = Counter(int(v) for v in modes.tolist())
     named_counts = {COLLECTOR_ID_TO_NAME.get(key, str(key)): value for key, value in sorted(mode_counts.items())}
+    if args.collector is not None:
+        collector = _stack_key(sliced, "collector_types").long()
+        expected_id = COLLECTOR_NAME_TO_ID[args.collector]
+        if not bool((collector == expected_id).all()):
+            raise RuntimeError(f"Sliced dataset contains non-{args.collector} transitions.")
     print(f"[Go2-DatasetSlice] source={source_path}")
     print(f"[Go2-DatasetSlice] save={save_path}")
     print(f"[Go2-DatasetSlice] selected_env_ids={env_ids.tolist()}")

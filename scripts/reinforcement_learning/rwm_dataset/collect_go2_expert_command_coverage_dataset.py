@@ -20,7 +20,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from flash_rl.agents import create_agent
-from flash_rl.envs.mjlab import configure_mjlab_randomization
+from flash_rl.envs.mjlab import configure_mjlab_randomization, mjlab_randomization_manifest
+from flash_rl.envs.mjlab_dr import friend_dr_runtime_snapshot
 from scripts.reinforcement_learning.rwm_dataset.dataset import (
     COLLECTOR_ID_TO_NAME,
     COLLECTOR_NAME_TO_ID,
@@ -99,6 +100,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num_envs", type=int, default=1024)
     parser.add_argument("--num_transitions", type=int, default=1_000_000)
+    parser.add_argument("--shard_id", type=int, default=0)
     parser.add_argument("--save_path", default="logs/rwm_datasets/go2_flat_expert_command_coverage_1m/dataset.pt")
     parser.add_argument("--expert_policy_path", default=DEFAULT_EXPERT_POLICY)
     parser.add_argument("--medium_policy_path", default=None)
@@ -136,6 +138,86 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--use_domain_randomization", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--use_push_randomization", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--use_observation_noise", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--randomization_preset",
+        choices=(
+            "default",
+            "old",
+            "friend_flat",
+            "calibrated_default",
+            "calibrated_friend_flat",
+        ),
+        default="default",
+    )
+    parser.add_argument(
+        "--randomization_components",
+        default=None,
+        help="Comma-separated friend_flat components for diagnostics; omitted means all.",
+    )
+    parser.add_argument(
+        "--randomization_scale",
+        type=float,
+        default=1.0,
+        help="Scale friend_flat ranges around their nominal centers; must be in [0, 1].",
+    )
+    parser.add_argument(
+        "--payload_mass_range_kg",
+        type=float,
+        nargs=2,
+        default=(0.0, 0.0),
+        metavar=("MIN", "MAX"),
+        help="Additional payload attached to the base link for the target gap.",
+    )
+    parser.add_argument(
+        "--payload_position_body_m",
+        type=float,
+        nargs=3,
+        default=(0.0, 0.0, 0.10),
+        metavar=("X", "Y", "Z"),
+    )
+    parser.add_argument(
+        "--payload_box_size_m",
+        type=float,
+        nargs=3,
+        default=(0.20, 0.12, 0.05),
+        metavar=("X", "Y", "Z"),
+    )
+    parser.add_argument(
+        "--rr_calf_strength_range",
+        type=float,
+        nargs=2,
+        default=(1.0, 1.0),
+        metavar=("MIN", "MAX"),
+        help="Target RR calf motor-strength gap, separate from background DR.",
+    )
+    parser.add_argument(
+        "--fixed_collector_assignment",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Keep each vector-env column on one collector so pure contiguous subsets can be extracted.",
+    )
+    parser.add_argument(
+        "--collector_assignment_seed",
+        type=int,
+        default=42,
+        help="Seed for fixed collector-to-env assignment; keep equal across independently collected shards.",
+    )
+    parser.add_argument("--env_action_noise_std", type=float, default=0.0)
+    parser.add_argument("--env_action_bias_std", type=float, default=0.0)
+    parser.add_argument(
+        "--env_action_scale_range",
+        type=float,
+        nargs=2,
+        default=(1.0, 1.0),
+        metavar=("MIN", "MAX"),
+    )
+    parser.add_argument(
+        "--env_action_delay_steps",
+        type=int,
+        nargs=2,
+        default=(0, 0),
+        metavar=("MIN", "MAX"),
+    )
     parser.add_argument("--headless", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
 
@@ -160,6 +242,34 @@ def _parse_joint_strength_scales(spec: list[str] | tuple[str, ...]) -> dict[str,
             raise ValueError(f"Joint strength scale for {name!r} must be in [0, 1], got {scale}.")
         scales[name] = scale
     return scales
+
+
+def _fixed_collector_ids(
+    collector_mix: dict[str, float],
+    num_envs: int,
+    device: torch.device | str,
+    seed: int,
+) -> torch.Tensor:
+    """Build an exact, reproducible collector allocation shared by all shards."""
+    names = [name for name, weight in collector_mix.items() if float(weight) > 0.0]
+    raw = [float(collector_mix[name]) * num_envs for name in names]
+    counts = [int(value) for value in raw]
+    remaining = num_envs - sum(counts)
+    fractional_order = sorted(
+        range(len(names)),
+        key=lambda index: raw[index] - counts[index],
+        reverse=True,
+    )
+    for index in fractional_order[:remaining]:
+        counts[index] += 1
+    ids = torch.cat(
+        [
+            torch.full((count,), COLLECTOR_NAME_TO_ID[name], dtype=torch.long)
+            for name, count in zip(names, counts, strict=True)
+        ]
+    )
+    generator = torch.Generator(device="cpu").manual_seed(int(seed))
+    return ids[torch.randperm(num_envs, generator=generator)].to(device=device)
 
 
 def _command_start_for_obs(obs_dim: int, actor_dim: int) -> int:
@@ -202,6 +312,12 @@ def _policy_obs_np(
         return _obs_group_np(obs_dict, "actor", command, actor_dim=actor_dim)
     if kind == "critic":
         return _obs_group_np(obs_dict, "critic", command, actor_dim=actor_dim)
+    if kind == "actor_with_critic_tail":
+        actor = obs_dict["actor"].detach().clone()
+        critic = obs_dict["critic"].detach().clone()
+        actor = _overwrite_command(actor, command, actor_dim=actor_dim)
+        critic = _overwrite_command(critic, command, actor_dim=actor_dim)
+        return torch.cat([actor, critic[:, actor_dim:]], dim=-1).cpu().numpy().astype(np.float32)
     if kind == "actor_critic":
         actor = obs_dict["actor"].detach().clone()
         critic = obs_dict["critic"].detach().clone()
@@ -383,7 +499,9 @@ def _load_expert_agent(
                 f"{flashsac_cfg_path} expects critic observations as the full observation, "
                 "but the collection task has no critic observation group."
             )
-        observation_kind = "critic"
+        # Preserve the checkpoint's full critic-sized input while ensuring the
+        # actor prefix comes from the (possibly corrupted) actor observation.
+        observation_kind = "actor_with_critic_tail"
         obs_dim = int(critic_dim)
     elif has_critic:
         observation_kind = "actor_critic"
@@ -477,6 +595,176 @@ def _mixed_actions(
     return actions.clamp(-1.0, 1.0)
 
 
+def _validate_action_interface_args(args: argparse.Namespace) -> tuple[int, int, float, float]:
+    delay_min = int(args.env_action_delay_steps[0])
+    delay_max = int(args.env_action_delay_steps[1])
+    if delay_min < 0 or delay_max < delay_min:
+        raise ValueError(f"Invalid env_action_delay_steps: {args.env_action_delay_steps}")
+    scale_min = float(args.env_action_scale_range[0])
+    scale_max = float(args.env_action_scale_range[1])
+    if scale_min <= 0.0 or scale_max < scale_min:
+        raise ValueError(f"Invalid env_action_scale_range: {args.env_action_scale_range}")
+    return delay_min, delay_max, scale_min, scale_max
+
+
+def _sample_env_action_scale(
+    num_envs: int,
+    action_dim: int,
+    *,
+    scale_min: float,
+    scale_max: float,
+    device: torch.device | str,
+) -> torch.Tensor:
+    if scale_min == 1.0 and scale_max == 1.0:
+        return torch.ones(num_envs, action_dim, device=device)
+    return torch.empty(num_envs, action_dim, device=device).uniform_(scale_min, scale_max)
+
+
+def _sample_env_action_bias(
+    num_envs: int,
+    action_dim: int,
+    *,
+    bias_std: float,
+    device: torch.device | str,
+) -> torch.Tensor:
+    if bias_std <= 0.0:
+        return torch.zeros(num_envs, action_dim, device=device)
+    return torch.randn(num_envs, action_dim, device=device) * float(bias_std)
+
+
+def _apply_env_step_action_interface(
+    actions: torch.Tensor,
+    *,
+    args: argparse.Namespace,
+    action_delay_history: torch.Tensor,
+    action_scale: torch.Tensor,
+    action_bias: torch.Tensor,
+    delay_min: int,
+    delay_max: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    action_t = actions * action_scale + action_bias
+    if float(args.env_action_noise_std) > 0.0:
+        action_t = action_t + float(args.env_action_noise_std) * torch.randn_like(action_t)
+    action_t = action_t.clamp(-1.0, 1.0)
+    if delay_max <= 0:
+        delays = torch.zeros(actions.shape[0], device=actions.device, dtype=torch.long)
+        return action_t, delays
+
+    action_delay_history[:-1].copy_(action_delay_history[1:].clone())
+    action_delay_history[-1].copy_(action_t)
+    delays = torch.randint(delay_min, delay_max + 1, (actions.shape[0],), device=actions.device)
+    env_ids = torch.arange(actions.shape[0], device=actions.device)
+    return action_delay_history[delay_max - delays, env_ids].clone(), delays
+
+
+def _startup_domain_table(env: Any) -> dict[str, Any]:
+    """Capture startup-sampled physical parameters for every vector environment."""
+
+    base_env = env.unwrapped
+    robot = base_env.scene["robot"]
+    model = base_env.sim.model
+    collision_local_ids = [
+        idx for idx, name in enumerate(robot.geom_names) if str(name).endswith("_collision")
+    ]
+    collision_global_ids = robot.indexing.geom_ids[
+        torch.as_tensor(collision_local_ids, device=base_env.device, dtype=torch.long)
+    ].long()
+    body_global_ids = robot.indexing.body_ids.long()
+    base_body_id = body_global_ids[0]
+    link_body_ids = body_global_ids[1:]
+
+    default_mass = base_env.sim.get_default_field("body_mass")
+    default_inertia = base_env.sim.get_default_field("body_inertia")
+    default_ipos = base_env.sim.get_default_field("body_ipos")
+    realized_mass = model.body_mass[:, body_global_ids]
+    realized_inertia = model.body_inertia[:, body_global_ids]
+
+    return {
+        "startup_domain_id": torch.arange(base_env.num_envs, dtype=torch.long),
+        "environment_local_id": torch.arange(base_env.num_envs, dtype=torch.long),
+        "collision_geom_names": [robot.geom_names[idx] for idx in collision_local_ids],
+        "body_names": list(robot.body_names),
+        "collision_friction": model.geom_friction[:, collision_global_ids, 0].detach().cpu(),
+        "base_mass_delta": (model.body_mass[:, base_body_id] - default_mass[base_body_id]).detach().cpu(),
+        "base_mass": model.body_mass[:, base_body_id].detach().cpu(),
+        "base_inertia_scale": (
+            model.body_inertia[:, base_body_id] / default_inertia[base_body_id].clamp_min(1e-12)
+        ).detach().cpu(),
+        "link_mass_scale": (
+            model.body_mass[:, link_body_ids] / default_mass[link_body_ids].clamp_min(1e-12)
+        ).detach().cpu(),
+        "link_inertia_scale": (
+            realized_inertia[:, 1:] / default_inertia[link_body_ids].clamp_min(1e-12)
+        ).detach().cpu(),
+        "base_com_offset": (
+            model.body_ipos[:, base_body_id] - default_ipos[base_body_id]
+        ).detach().cpu(),
+        "realized_body_mass": realized_mass.detach().cpu(),
+    }
+
+
+def _episode_domain_rows(
+    env: Any,
+    *,
+    env_ids: torch.Tensor,
+    episode_ids: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Capture reset-time parameters once per episode instead of per transition."""
+
+    base_env = env.unwrapped
+    env_ids = env_ids.to(base_env.device, dtype=torch.long)
+    runtime = friend_dr_runtime_snapshot(base_env, env_ids)
+    robot = base_env.scene["robot"]
+    num_rows = len(env_ids)
+    action_dim = int(robot.num_actuators)
+
+    def runtime_or(key: str, width: int, value: float) -> torch.Tensor:
+        tensor = runtime.get(key)
+        if tensor is None:
+            return torch.full((num_rows, width), value, device=base_env.device)
+        return tensor
+
+    root_velocity = getattr(robot.data, "root_link_vel_w", None)
+    if root_velocity is None:
+        root_velocity_rows = torch.zeros(num_rows, 6, device=base_env.device)
+    else:
+        root_velocity_rows = root_velocity[env_ids, :6]
+    joint_position_rows = robot.data.joint_pos[env_ids]
+    joint_velocity_rows = robot.data.joint_vel[env_ids]
+    default_joint_position = robot.data.default_joint_pos[env_ids]
+    derived_joint_scale = joint_position_rows / torch.where(
+        default_joint_position.abs() > 1e-8,
+        default_joint_position,
+        torch.ones_like(default_joint_position),
+    )
+    joint_reset_scale = runtime.get("joint_reset_scale", derived_joint_scale)
+
+    return {
+        "episode_id": episode_ids.detach().cpu().long(),
+        "startup_domain_id": env_ids.detach().cpu().long(),
+        "kp_scale": runtime_or("kp_scale", action_dim, 1.0).detach().cpu().float(),
+        "kd_scale": runtime_or("kd_scale", action_dim, 1.0).detach().cpu().float(),
+        "motor_strength": runtime_or("motor_strength", action_dim, 1.0).detach().cpu().float(),
+        "motor_zero_offset": runtime_or("motor_zero_offset", action_dim, 0.0).detach().cpu().float(),
+        "joint_reset_scale": joint_reset_scale.detach().cpu().float(),
+        "reset_joint_position": joint_position_rows.detach().cpu().float(),
+        "reset_joint_velocity": joint_velocity_rows.detach().cpu().float(),
+        "reset_base_velocity": root_velocity_rows.detach().cpu().float(),
+    }
+
+
+def _append_table_chunks(
+    chunks: dict[str, list[torch.Tensor]],
+    rows: dict[str, torch.Tensor],
+) -> None:
+    for key, value in rows.items():
+        chunks.setdefault(key, []).append(value)
+
+
+def _finish_table_chunks(chunks: dict[str, list[torch.Tensor]]) -> dict[str, torch.Tensor]:
+    return {key: torch.cat(values, dim=0) for key, values in chunks.items()}
+
+
 def _new_builder(args: argparse.Namespace, dims: Any, metadata: dict[str, Any]) -> Go2MixedDatasetBuilder:
     return Go2MixedDatasetBuilder(
         state_dim=int(dims.state_dim),
@@ -510,19 +798,26 @@ def main() -> None:
     env_cfg.seed = int(args.seed)
     if hasattr(env_cfg, "auto_reset"):
         env_cfg.auto_reset = True
-    configure_mjlab_randomization(
-        env_cfg,
-        use_domain_randomization=bool(args.use_domain_randomization),
-        use_push_randomization=bool(args.use_push_randomization),
-        use_observation_noise=bool(args.use_observation_noise),
-    )
-    _configure_command_cfg(env_cfg, args)
     requested_strength_scales = _parse_joint_strength_scales(args.joint_strength_scales)
     broken_joint_names = tuple(dict.fromkeys(str(name) for name in args.broken_joint_names if str(name)))
     joint_strength_scales = dict(requested_strength_scales)
     for joint_name in broken_joint_names:
         joint_strength_scales[joint_name] = 0.0
     applied_strength_scales = apply_go2_pd_joint_strength_scales(env_cfg, joint_strength_scales)
+    configure_mjlab_randomization(
+        env_cfg,
+        use_domain_randomization=bool(args.use_domain_randomization),
+        use_push_randomization=bool(args.use_push_randomization),
+        use_observation_noise=bool(args.use_observation_noise),
+        randomization_preset=str(args.randomization_preset),
+        randomization_components=args.randomization_components,
+        randomization_scale=float(args.randomization_scale),
+        payload_mass_range_kg=tuple(float(x) for x in args.payload_mass_range_kg),
+        payload_position_body_m=tuple(float(x) for x in args.payload_position_body_m),
+        payload_box_size_m=tuple(float(x) for x in args.payload_box_size_m),
+        rr_calf_strength_range=tuple(float(x) for x in args.rr_calf_strength_range),
+    )
+    _configure_command_cfg(env_cfg, args)
 
     env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
     extractor = Go2RWMExtractor(env.unwrapped)
@@ -531,6 +826,7 @@ def main() -> None:
     critic_space = env.single_observation_space.spaces.get("critic")
     critic_dim = None if critic_space is None else int(critic_space.shape[0])
     action_dim = int(env.single_action_space.shape[0])
+    delay_min, delay_max, action_scale_min, action_scale_max = _validate_action_interface_args(args)
     dataset_obs_kind = _resolve_dataset_obs_kind(str(args.dataset_obs_kind), actor_dim=actor_dim)
     dataset_obs_dim = PROPRIOCEPTIVE_ACTOR_OBS_DIM if dataset_obs_kind == "proprioceptive" else int(dims.policy_obs_dim)
 
@@ -569,6 +865,7 @@ def main() -> None:
     metadata = {
         "task": str(args.task),
         "robot": "Unitree-Go2",
+        "seed": int(args.seed),
         "dt": float(getattr(env_cfg, "step_dt", 0.02)),
         "obs_dim": int(dataset_obs_dim),
         "dataset_obs_kind": dataset_obs_kind,
@@ -579,9 +876,12 @@ def main() -> None:
         "termination_dim": int(dims.termination_dim),
         "live_actor_obs_dim": actor_dim,
         "live_critic_obs_dim": critic_dim,
+        "actuator_names": list(env.scene["robot"].actuator_names),
+        "joint_names": list(env.scene["robot"].joint_names),
         "expert_policy_observation_kind": None if expert_agent is None else expert_agent.observation_kind,
         "medium_policy_observation_kind": None if medium_agent is None else medium_agent.observation_kind,
         "num_envs": int(args.num_envs),
+        "shard_id": int(args.shard_id),
         "requested_num_transitions": int(args.num_transitions),
         "collector_mix": dict(collector_mix),
         "collector_id_to_name": dict(COLLECTOR_ID_TO_NAME),
@@ -605,10 +905,33 @@ def main() -> None:
         ],
         "broken_pd_joint_names": list(broken_joint_names),
         "joint_strength_scales": dict(applied_strength_scales),
+        "target_gap": {
+            "payload_mass_range_kg": [float(x) for x in args.payload_mass_range_kg],
+            "payload_position_body_m": [float(x) for x in args.payload_position_body_m],
+            "payload_box_size_m": [float(x) for x in args.payload_box_size_m],
+            "rr_calf_strength_range": [float(x) for x in args.rr_calf_strength_range],
+        },
+        "fixed_collector_assignment": bool(args.fixed_collector_assignment),
+        "collector_assignment_seed": int(args.collector_assignment_seed),
         "env_randomization": {
             "use_domain_randomization": bool(args.use_domain_randomization),
             "use_push_randomization": bool(args.use_push_randomization),
             "use_observation_noise": bool(args.use_observation_noise),
+            "randomization_preset": str(args.randomization_preset),
+            "randomization_components": args.randomization_components,
+            "randomization_scale": float(args.randomization_scale),
+            "manifest": mjlab_randomization_manifest(
+                str(args.randomization_preset),
+                args.randomization_components,
+                float(args.randomization_scale),
+            ),
+        },
+        "env_step_action_interface": {
+            "env_action_noise_std": float(args.env_action_noise_std),
+            "env_action_bias_std": float(args.env_action_bias_std),
+            "env_action_scale_range": [float(action_scale_min), float(action_scale_max)],
+            "env_action_delay_steps": [int(delay_min), int(delay_max)],
+            "dataset_action": "post_interface_env_step_action",
         },
     }
 
@@ -648,10 +971,39 @@ def main() -> None:
     _force_commands(env.unwrapped, commands)
 
     last_actions = torch.zeros(int(args.num_envs), action_dim, device=env.device)
+    action_delay_history = torch.zeros(delay_max + 1, int(args.num_envs), action_dim, device=env.device)
+    env_action_scale = _sample_env_action_scale(
+        int(args.num_envs),
+        action_dim,
+        scale_min=action_scale_min,
+        scale_max=action_scale_max,
+        device=env.device,
+    )
+    env_action_bias = _sample_env_action_bias(
+        int(args.num_envs),
+        action_dim,
+        bias_std=float(args.env_action_bias_std),
+        device=env.device,
+    )
     episode_ids = torch.arange(int(args.num_envs), device=env.device, dtype=torch.long)
     next_episode_id = int(args.num_envs)
+    startup_domain_table = _startup_domain_table(env)
+    episode_domain_chunks: dict[str, list[torch.Tensor]] = {}
+    all_env_ids = torch.arange(int(args.num_envs), device=env.device, dtype=torch.long)
+    _append_table_chunks(
+        episode_domain_chunks,
+        _episode_domain_rows(env, env_ids=all_env_ids, episode_ids=episode_ids),
+    )
     timesteps = torch.zeros(int(args.num_envs), device=env.device, dtype=torch.long)
-    collector_ids = sample_collector_ids(collector_mix, int(args.num_envs), env.device)
+    if args.fixed_collector_assignment:
+        collector_ids = _fixed_collector_ids(
+            collector_mix,
+            int(args.num_envs),
+            env.device,
+            int(args.collector_assignment_seed),
+        )
+    else:
+        collector_ids = sample_collector_ids(collector_mix, int(args.num_envs), env.device)
     collector_counts = torch.zeros(len(COLLECTOR_ID_TO_NAME), dtype=torch.long)
     mode_counts = torch.zeros(len(modes), dtype=torch.long)
     returns = torch.zeros(int(args.num_envs), device=env.device)
@@ -689,9 +1041,16 @@ def main() -> None:
         f"[Go2-ExpertCoverageDataset] mix={collector_mix}, modes={metadata['command_mode_weights']}, "
         f"num_envs={args.num_envs}, target_transitions={args.num_transitions}"
     )
+    print(
+        "[Go2-ExpertCoverageDataset] target_gap="
+        f"{metadata['target_gap']}, fixed_collector_assignment={args.fixed_collector_assignment}"
+    )
 
     for _ in tqdm.trange(total_steps, smoothing=0.1, mininterval=0.5):
         _force_commands(env.unwrapped, commands)
+        transition_episode_ids = episode_ids.clone()
+        transition_timesteps = timesteps.clone()
+        transition_collector_ids = collector_ids.clone()
         state = extractor.extract_state()
         command = commands.clone()
         prev_action = last_actions.clone()
@@ -703,6 +1062,12 @@ def main() -> None:
         }
         if critic_dim is not None:
             observations_by_kind["critic"] = _policy_obs_np(obs_dict, command, kind="critic", actor_dim=actor_dim)
+            observations_by_kind["actor_with_critic_tail"] = _policy_obs_np(
+                obs_dict,
+                command,
+                kind="actor_with_critic_tail",
+                actor_dim=actor_dim,
+            )
             observations_by_kind["actor_critic"] = _policy_obs_np(
                 obs_dict,
                 command,
@@ -721,8 +1086,21 @@ def main() -> None:
             medium_action_noise_std=float(args.medium_action_noise_std),
             failure_action_noise_std=float(args.failure_action_noise_std),
         )
+        env_action_t, env_action_delay_steps = _apply_env_step_action_interface(
+            action_t,
+            args=args,
+            action_delay_history=action_delay_history,
+            action_scale=env_action_scale,
+            action_bias=env_action_bias,
+            delay_min=delay_min,
+            delay_max=delay_max,
+        )
 
-        obs_dict, rewards, terminateds, truncateds, _extras = env.step(action_t)
+        obs_dict, rewards, terminateds, truncateds, _extras = env.step(env_action_t)
+        actuator_delay_substeps = friend_dr_runtime_snapshot(env.unwrapped).get(
+            "actuator_delay_substeps",
+            torch.zeros(int(args.num_envs), device=env.device, dtype=torch.long),
+        )
         next_state = extractor.extract_state()
         contact = extractor.extract_contact()
         termination = extractor.extract_termination()
@@ -753,8 +1131,26 @@ def main() -> None:
             )
             next_episode_id += int(done_ids.numel())
             episode_ids[done_ids] = new_ids
+            _append_table_chunks(
+                episode_domain_chunks,
+                _episode_domain_rows(env, env_ids=done_ids, episode_ids=new_ids),
+            )
             timesteps[done_ids] = 0
             resample_ids = torch.unique(torch.cat([resample_ids, done_ids]))
+            action_delay_history[:, done_ids] = 0.0
+            env_action_scale[done_ids] = _sample_env_action_scale(
+                int(done_ids.numel()),
+                action_dim,
+                scale_min=action_scale_min,
+                scale_max=action_scale_max,
+                device=env.device,
+            )
+            env_action_bias[done_ids] = _sample_env_action_bias(
+                int(done_ids.numel()),
+                action_dim,
+                bias_std=float(args.env_action_bias_std),
+                device=env.device,
+            )
 
         if resample_ids.numel() > 0:
             mode_ids[resample_ids] = _sample_mode_ids(mode_weights, int(resample_ids.numel()))
@@ -774,21 +1170,32 @@ def main() -> None:
                 device=env.device,
             )
             command_ages[resample_ids] = 0
-            collector_ids[resample_ids] = sample_collector_ids(collector_mix, int(resample_ids.numel()), env.device)
+            if not args.fixed_collector_assignment:
+                collector_ids[resample_ids] = sample_collector_ids(
+                    collector_mix,
+                    int(resample_ids.numel()),
+                    env.device,
+                )
 
         not_done = ~done
         timesteps[not_done] += 1
         command_ages[not_done] += 1
-        last_actions = action_t
+        next_prev_action = env_action_t.clone()
+        next_prev_action[done_ids] = 0.0
+        last_actions = next_prev_action
         _force_commands(env.unwrapped, commands)
-        next_full_obs_t = make_go2_policy_obs(next_state, commands, action_t)
+        next_full_obs_t = make_go2_policy_obs(next_state, commands, next_prev_action)
         next_obs_t = _dataset_obs_t(next_full_obs_t, kind=dataset_obs_kind)
 
         builder.add(
             obs=obs_t,
             next_obs=next_obs_t,
             state=state,
-            action=action_t,
+            action=env_action_t,
+            raw_action=action_t,
+            env_action_delay_step=env_action_delay_steps,
+            actuator_delay_substep=actuator_delay_substeps,
+            noisy_actor_observation=torch.from_numpy(observations_by_kind["actor"]),
             next_state=next_state,
             contact=contact,
             termination=termination,
@@ -797,9 +1204,9 @@ def main() -> None:
             done=done,
             timeout=truncateds,
             prev_action=prev_action,
-            episode_id=episode_ids,
-            timestep=timesteps,
-            collector_type=collector_ids,
+            episode_id=transition_episode_ids,
+            timestep=transition_timesteps,
+            collector_type=transition_collector_ids,
         )
         flush_part(force=False)
 
@@ -826,11 +1233,30 @@ def main() -> None:
             },
             "mean_reward": float(np.mean(completed_returns)) if completed_returns else float(returns.mean().item()),
             "mean_episode_length": float(np.mean(completed_lengths)) if completed_lengths else float(lengths.float().mean().item()),
+            "completed_episode_count": int(len(completed_lengths)),
             "termination_count": int(termination_count),
             "timeout_count": int(timeout_count),
             "collection_seconds": float(time.perf_counter() - start_time),
         }
     )
+    dataset["startup_domain_table"] = startup_domain_table
+    dataset["episode_domain_table"] = _finish_table_chunks(episode_domain_chunks)
+    dataset["metadata"]["dr_provenance_schema"] = {
+        "version": 1,
+        "startup_domain_rows": int(startup_domain_table["startup_domain_id"].numel()),
+        "episode_domain_rows": int(dataset["episode_domain_table"]["episode_id"].numel()),
+        "transition_fields": [
+            "raw_actions",
+            "actions",
+            "env_action_delay_steps",
+            "actuator_delay_substeps",
+            "observations",
+            "next_observations",
+            "noisy_actor_observations",
+        ],
+        "actions_semantics": "post_collector_and_env_interface_command_sent_to_mjlab",
+        "actuator_delay_semantics": "physics_substeps_using_the_previous_policy_target",
+    }
     save_dataset_dict(dataset, save_path)
     file_mb = save_path.stat().st_size / (1024 * 1024)
     print("[Go2-ExpertCoverageDataset] complete")

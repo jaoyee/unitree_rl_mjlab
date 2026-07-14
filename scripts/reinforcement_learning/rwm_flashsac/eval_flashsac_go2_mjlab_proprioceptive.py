@@ -21,8 +21,14 @@ from scripts.reinforcement_learning.rwm_flashsac.agent_proprioceptive import (
     create_go2_flashsac_proprioceptive_agent,
 )
 from scripts.reinforcement_learning.rwm_dataset.broken_go2 import (
-    apply_go2_broken_pd_joints,
     apply_go2_pd_joint_strength_scales,
+)
+from scripts.reinforcement_learning.rwm_dataset.go2_contact_velocity_estimator import (
+    estimate_go2_base_lin_vel_b,
+)
+from flash_rl.envs.mjlab import (
+    configure_mjlab_randomization,
+    normalize_friend_flat_dr_components,
 )
 from scripts.reinforcement_learning.rwm_flashsac.utils import (
     apply_policy_observation_mask_np,
@@ -54,8 +60,53 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--fixed_command", type=float, nargs=3, metavar=("VX", "VY", "YAW"), default=None)
+    parser.add_argument(
+        "--command_sequence",
+        action="append",
+        default=None,
+        help=(
+            "Repeat for each vx,vy,yaw command; use --command_sequence=value "
+            "when the first component is negative."
+        ),
+    )
+    parser.add_argument("--command_switch_steps", type=int, default=300)
     parser.add_argument("--clean", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--randomization_preset",
+        choices=(
+            "default",
+            "friend_flat",
+            "calibrated_default",
+            "calibrated_friend_flat",
+        ),
+        default="default",
+        help="Physical/observation DR preset used with --no-clean.",
+    )
+    parser.add_argument(
+        "--randomization_components",
+        default="all",
+        help=(
+            "Comma/space-separated friend_flat components used with --no-clean. "
+            "Allowed: friction,mass_com,motor,delay,observation,push,initial_state,all."
+        ),
+    )
+    parser.add_argument(
+        "--randomization_scale",
+        type=float,
+        default=1.0,
+        help="Scale friend_flat ranges around nominal centers; must be in [0, 1].",
+    )
     parser.add_argument("--output_json", default=None)
+    parser.add_argument(
+        "--validate_contact_velocity_estimator",
+        action="store_true",
+        help="Compare the deployment-observable contact estimator with simulator base velocity truth.",
+    )
+    parser.add_argument(
+        "--velocity_estimator_samples_npz",
+        default=None,
+        help="Optional NPZ output containing per-step estimator inputs and simulator truth.",
+    )
     parser.add_argument("--broken_joint_names", nargs="*", default=None)
     parser.add_argument(
         "--joint_strength_scales",
@@ -108,13 +159,28 @@ def _parse_joint_strength_scales(spec: list[str] | tuple[str, ...]) -> dict[str,
     return scales
 
 
-def _configure_fixed_command_range(env_cfg: Any, fixed_command: tuple[float, float, float] | None) -> None:
-    if fixed_command is None or "twist" not in env_cfg.commands:
+def _parse_command_sequence(values: list[str] | None) -> list[tuple[float, float, float]]:
+    commands: list[tuple[float, float, float]] = []
+    for value in values or []:
+        fields = value.replace(";", ",").split(",")
+        if len(fields) != 3:
+            raise ValueError(f"Expected command triplet vx,vy,yaw, got {value!r}")
+        commands.append(tuple(float(field) for field in fields))
+    return commands
+
+
+def _configure_fixed_command_range(
+    env_cfg: Any,
+    fixed_command: tuple[float, float, float] | None,
+    command_sequence: list[tuple[float, float, float]],
+) -> None:
+    commands = command_sequence or ([fixed_command] if fixed_command is not None else [])
+    if not commands or "twist" not in env_cfg.commands:
         return
     twist_cmd = env_cfg.commands["twist"]
-    twist_cmd.ranges.lin_vel_x = (fixed_command[0], fixed_command[0])
-    twist_cmd.ranges.lin_vel_y = (fixed_command[1], fixed_command[1])
-    twist_cmd.ranges.ang_vel_z = (fixed_command[2], fixed_command[2])
+    twist_cmd.ranges.lin_vel_x = (-max(0.1, max(abs(cmd[0]) for cmd in commands)), max(0.1, max(abs(cmd[0]) for cmd in commands)))
+    twist_cmd.ranges.lin_vel_y = (-max(0.1, max(abs(cmd[1]) for cmd in commands)), max(0.1, max(abs(cmd[1]) for cmd in commands)))
+    twist_cmd.ranges.ang_vel_z = (-max(0.1, max(abs(cmd[2]) for cmd in commands)), max(0.1, max(abs(cmd[2]) for cmd in commands)))
     if hasattr(twist_cmd.ranges, "heading"):
         twist_cmd.ranges.heading = None
     if hasattr(twist_cmd, "heading_command"):
@@ -173,6 +239,12 @@ def main() -> None:
     set_seed(args.seed)
     broken_joint_names = get_world_model_broken_joint_names(cfg, args.broken_joint_names)
     joint_strength_scales = _parse_joint_strength_scales(args.joint_strength_scales)
+    command_sequence = _parse_command_sequence(args.command_sequence)
+    randomization_components = (
+        frozenset()
+        if args.clean
+        else normalize_friend_flat_dr_components(args.randomization_components)
+    )
 
     import mjlab.tasks  # noqa: F401
     import src.tasks  # noqa: F401
@@ -186,17 +258,36 @@ def main() -> None:
     env_cfg.scene.num_envs = args.num_envs
     env_cfg.seed = args.seed
     env_cfg.auto_reset = True
+    # The E/D experiment is flat-ground only. Some play configs retain a
+    # terrain-reset event even though terrain is not an experimental factor.
+    env_cfg.events.pop("randomize_terrain", None)
+
+    # Match dataset collection ordering: establish the weakened/broken robot
+    # first, then wrap those actuators with the selected DR preset.
+    effective_joint_strength_scales = dict(joint_strength_scales)
+    for joint_name in broken_joint_names:
+        effective_joint_strength_scales[joint_name] = 0.0
+    if effective_joint_strength_scales:
+        apply_go2_pd_joint_strength_scales(env_cfg, effective_joint_strength_scales)
+
     if args.clean:
         _disable_randomization(env_cfg)
-    if joint_strength_scales:
-        apply_go2_pd_joint_strength_scales(env_cfg, joint_strength_scales)
-    if broken_joint_names:
-        apply_go2_broken_pd_joints(env_cfg, broken_joint_names)
+    else:
+        configure_mjlab_randomization(
+            env_cfg,
+            use_domain_randomization=True,
+            use_push_randomization=True,
+            use_observation_noise=True,
+            randomization_preset=args.randomization_preset,
+            randomization_components=randomization_components,
+            randomization_scale=args.randomization_scale,
+        )
     fixed_command = tuple(args.fixed_command) if args.fixed_command is not None else None
-    _configure_fixed_command_range(env_cfg, fixed_command)
+    _configure_fixed_command_range(env_cfg, fixed_command, command_sequence)
+    initial_command = command_sequence[0] if command_sequence else fixed_command
 
     env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
-    _force_fixed_command(env, fixed_command)
+    _force_fixed_command(env, initial_command)
     full_actor_dim = int(env.single_observation_space.spaces["actor"].shape[0])
     full_action_dim = int(env.single_action_space.shape[0])
     if full_actor_dim != 48:
@@ -217,8 +308,8 @@ def main() -> None:
     agent.load(str(checkpoint_path))
 
     obs_dict, _ = env.reset()
-    _force_fixed_command(env, fixed_command)
-    full_observations = _apply_command_to_full_obs(_actor_obs(obs_dict), fixed_command)
+    _force_fixed_command(env, initial_command)
+    full_observations = _apply_command_to_full_obs(_actor_obs(obs_dict), initial_command)
 
     ep_returns = np.zeros(args.num_envs, dtype=np.float64)
     ep_lengths = np.zeros(args.num_envs, dtype=np.int64)
@@ -231,9 +322,20 @@ def main() -> None:
     base_ang_vel_samples: list[np.ndarray] = []
     command_samples: list[np.ndarray] = []
     action_abs_samples: list[float] = []
+    estimated_base_lin_vel_samples: list[np.ndarray] = []
+    estimated_base_lin_vel_truth_samples: list[np.ndarray] = []
+    estimator_confidence_samples: list[np.ndarray] = []
+    estimator_per_foot_samples: list[np.ndarray] = []
+    estimator_contact_samples: list[np.ndarray] = []
 
     print(f"[Go2-FlashSAC-RWM-Proprioceptive-Eval] checkpoint={checkpoint_path}")
-    print(f"[Go2-FlashSAC-RWM-Proprioceptive-Eval] task={args.task}, clean={args.clean}, device={device}, num_envs={args.num_envs}")
+    print(
+        "[Go2-FlashSAC-RWM-Proprioceptive-Eval] "
+        f"task={args.task}, clean={args.clean}, randomization_preset={args.randomization_preset}, "
+        f"randomization_components={sorted(randomization_components)}, "
+        f"randomization_scale={args.randomization_scale}, "
+        f"device={device}, num_envs={args.num_envs}"
+    )
     print(f"[Go2-FlashSAC-RWM-Proprioceptive-Eval] broken_joint_names={list(broken_joint_names)}")
     print(f"[Go2-FlashSAC-RWM-Proprioceptive-Eval] joint_strength_scales={joint_strength_scales}")
     print(
@@ -245,11 +347,21 @@ def main() -> None:
     )
     if fixed_command is not None:
         print(f"[Go2-FlashSAC-RWM-Proprioceptive-Eval] fixed_command={fixed_command}")
+    if command_sequence:
+        print(
+            "[Go2-FlashSAC-RWM-Proprioceptive-Eval] "
+            f"command_sequence={command_sequence}, switch_steps={args.command_switch_steps}"
+        )
 
     with torch.no_grad():
         for _step in range(args.steps):
-            _force_fixed_command(env, fixed_command)
-            full_observations = _apply_command_to_full_obs(full_observations, fixed_command)
+            current_command = (
+                command_sequence[(_step // max(1, args.command_switch_steps)) % len(command_sequence)]
+                if command_sequence
+                else fixed_command
+            )
+            _force_fixed_command(env, current_command)
+            full_observations = _apply_command_to_full_obs(full_observations, current_command)
             policy_observations = apply_policy_observation_mask_np(
                 full_observations,
                 policy_observation_mask_indices,
@@ -269,6 +381,34 @@ def main() -> None:
             base_lin_vel_samples.append(full_observations[:, 0:3].copy())
             base_ang_vel_samples.append(full_observations[:, 3:6].copy())
             command_samples.append(full_observations[:, 9:12].copy())
+            if args.validate_contact_velocity_estimator:
+                robot_data = env.scene["robot"].data
+                contact_data = env.scene["feet_ground_contact"].data.found
+                if contact_data is None:
+                    contact = torch.zeros(args.num_envs, 4, device=device)
+                else:
+                    contact = (contact_data > 0).float()
+                estimated_velocity, confidence, per_foot_velocity = estimate_go2_base_lin_vel_b(
+                    robot_data.joint_pos,
+                    robot_data.joint_vel,
+                    robot_data.root_link_ang_vel_b,
+                    contact,
+                )
+                estimated_base_lin_vel_samples.append(
+                    estimated_velocity.detach().cpu().numpy().astype(np.float32)
+                )
+                estimated_base_lin_vel_truth_samples.append(
+                    robot_data.root_link_lin_vel_b.detach().cpu().numpy().astype(np.float32)
+                )
+                estimator_confidence_samples.append(
+                    confidence.detach().cpu().numpy().astype(np.float32)
+                )
+                estimator_per_foot_samples.append(
+                    per_foot_velocity.detach().cpu().numpy().astype(np.float32)
+                )
+                estimator_contact_samples.append(
+                    contact.detach().cpu().numpy().astype(np.float32)
+                )
             actions_t = torch.from_numpy(actions_np).to(device=device, dtype=torch.float32)
             obs_dict, rewards, terminateds, truncateds, extras = env.step(actions_t)
             rewards_np = rewards.detach().cpu().numpy().astype(np.float64)
@@ -290,8 +430,8 @@ def main() -> None:
             for key, value in (extras.get("log") or {}).items():
                 logged_metrics[key].append(float(scalarize(value)))
 
-            _force_fixed_command(env, fixed_command)
-            full_observations = _apply_command_to_full_obs(_actor_obs(obs_dict), fixed_command)
+            _force_fixed_command(env, current_command)
+            full_observations = _apply_command_to_full_obs(_actor_obs(obs_dict), current_command)
 
     env.close()
 
@@ -304,6 +444,18 @@ def main() -> None:
     vel_error_xy = np.linalg.norm(base_lin_vel[:, 0:2] - commands[:, 0:2], axis=1)
     yaw_error = np.abs(base_ang_vel[:, 2] - commands[:, 2])
     summary = {
+        "checkpoint_path": str(checkpoint_path),
+        "task": str(args.task),
+        "seed": int(args.seed),
+        "steps": int(args.steps),
+        "num_envs": int(args.num_envs),
+        "clean": bool(args.clean),
+        "randomization_preset": "clean" if args.clean else str(args.randomization_preset),
+        "randomization_components": sorted(randomization_components),
+        "randomization_scale": 0.0 if args.clean else float(args.randomization_scale),
+        "joint_strength_scales": dict(effective_joint_strength_scales),
+        "command_sequence": [list(command) for command in command_sequence],
+        "command_switch_steps": int(args.command_switch_steps),
         "mean_return": mean_return,
         "std_return": std_return,
         "mean_episode_length": mean_episode_length,
@@ -322,6 +474,42 @@ def main() -> None:
         "error_vel_yaw": float(yaw_error.mean()),
         "action_abs_mean": _mean(action_abs_samples),
     }
+
+    if args.validate_contact_velocity_estimator and estimated_base_lin_vel_samples:
+        estimated = np.concatenate(estimated_base_lin_vel_samples, axis=0)
+        estimated_truth = np.concatenate(estimated_base_lin_vel_truth_samples, axis=0)
+        confidence = np.concatenate(estimator_confidence_samples, axis=0)
+        valid = confidence > 0.0
+        error = estimated[valid] - estimated_truth[valid]
+        if error.size:
+            summary["contact_velocity_estimator"] = {
+                "valid_fraction": float(valid.mean()),
+                "mean_confidence": float(confidence.mean()),
+                "mae_xyz": np.mean(np.abs(error), axis=0).tolist(),
+                "rmse_xyz": np.sqrt(np.mean(np.square(error), axis=0)).tolist(),
+                "mae_xy": float(np.linalg.norm(error[:, :2], axis=1).mean()),
+                "rmse_xy": float(np.sqrt(np.mean(np.sum(np.square(error[:, :2]), axis=1)))),
+                "truth_speed_xy_mean": float(
+                    np.linalg.norm(estimated_truth[valid, :2], axis=1).mean()
+                ),
+                "estimated_speed_xy_mean": float(
+                    np.linalg.norm(estimated[valid, :2], axis=1).mean()
+                ),
+            }
+        if args.velocity_estimator_samples_npz:
+            samples_path = Path(args.velocity_estimator_samples_npz)
+            if not samples_path.is_absolute():
+                samples_path = resolve_repo_path(samples_path)
+            samples_path.parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(
+                samples_path,
+                estimated=np.stack(estimated_base_lin_vel_samples, axis=0),
+                truth=np.stack(estimated_base_lin_vel_truth_samples, axis=0),
+                confidence=np.stack(estimator_confidence_samples, axis=0),
+                per_foot=np.stack(estimator_per_foot_samples, axis=0),
+                contact=np.stack(estimator_contact_samples, axis=0),
+            )
+            summary["contact_velocity_estimator"]["samples_npz"] = str(samples_path)
 
     print("[Go2-FlashSAC-RWM-Proprioceptive-Eval] Summary")
     for key, value in summary.items():

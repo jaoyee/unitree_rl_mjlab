@@ -110,6 +110,10 @@ def main() -> None:
     base_play.set_seed(args.seed)
     fixed_command = tuple(args.fixed_command) if args.fixed_command is not None else None
     command_sequence = base_play._parse_command_sequence(args.command_sequence)
+    if args.manual_command and (fixed_command is not None or command_sequence or args.random_command):
+        raise ValueError(
+            "--manual_command cannot be combined with --fixed_command, --command_sequence, or --random_command."
+        )
     random_ranges = (
         tuple(args.random_lin_vel_x),
         tuple(args.random_lin_vel_y),
@@ -144,11 +148,12 @@ def main() -> None:
         env_cfg,
         fixed_command,
         command_sequence,
-        random_ranges=random_ranges if args.random_command else None,
+        random_ranges=random_ranges if (args.random_command or args.manual_command) else None,
+        manual_command=bool(args.manual_command),
     )
 
     env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
-    base_play._force_fixed_command(env, fixed_command)
+    base_play._force_fixed_command(env, (0.0, 0.0, 0.0) if args.manual_command else fixed_command)
     actor_dim = int(env.single_observation_space.spaces["actor"].shape[0])
     critic_space = env.single_observation_space.spaces.get("critic")
     critic_dim = None if critic_space is None else int(critic_space.shape[0])
@@ -179,7 +184,10 @@ def main() -> None:
     agent.load(str(checkpoint_path))
 
     wrapped_env = RslRlVecEnvWrapper(env, clip_actions=1.0)
-    base_play._force_fixed_command(wrapped_env, fixed_command)
+    base_play._force_fixed_command(
+        wrapped_env,
+        (0.0, 0.0, 0.0) if args.manual_command else fixed_command,
+    )
     policy = ProprioceptiveFlashSACPolicyAdapter(
         agent=agent,
         device=device,
@@ -187,6 +195,7 @@ def main() -> None:
         command_sequence=command_sequence,
         command_switch_steps=args.command_switch_steps,
         random_command=bool(args.random_command),
+        manual_command=bool(args.manual_command),
         random_ranges=random_ranges,
         random_stand_prob=args.random_stand_prob,
         env=wrapped_env,
@@ -210,6 +219,8 @@ def main() -> None:
     )
     if fixed_command is not None:
         print(f"[Go2-FlashSAC-RWM-Proprio-Play] fixed_command={fixed_command}")
+    if args.manual_command:
+        print("[Go2-FlashSAC-RWM-Proprio-Play] manual_command=True, initial_command=(0.0, 0.0, 0.0)")
     if command_sequence:
         print(
             "[Go2-FlashSAC-RWM-Proprio-Play] command_sequence="
@@ -222,10 +233,7 @@ def main() -> None:
             f"stand_prob={args.random_stand_prob}"
         )
 
-    if resolved_viewer == "native":
-        NativeMujocoViewer(wrapped_env, policy, frame_rate=args.frame_rate).run()
-    else:
-        ViserPlayViewer(wrapped_env, policy, frame_rate=args.frame_rate).run()
+    base_play._run_viewer(resolved_viewer, wrapped_env, policy, args.frame_rate, args.viser_port)
     wrapped_env.close()
 
 

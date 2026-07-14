@@ -49,8 +49,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--num_envs", type=int, default=1)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--viewer", choices=("auto", "native", "viser"), default="auto")
+    parser.add_argument("--viser_port", type=int, default=8080)
     parser.add_argument("--frame_rate", type=float, default=60.0)
     parser.add_argument("--fixed_command", type=float, nargs=3, metavar=("VX", "VY", "YAW"), default=None)
+    parser.add_argument(
+        "--manual_command",
+        action="store_true",
+        help="Start at zero command and use the Viser Commands controls without automatic resampling.",
+    )
     parser.add_argument(
         "--command_sequence",
         nargs="+",
@@ -130,6 +136,7 @@ def _configure_command_ranges(
     fixed_command: tuple[float, float, float] | None,
     command_sequence: list[tuple[float, float, float]],
     random_ranges: tuple[tuple[float, float], tuple[float, float], tuple[float, float]] | None = None,
+    manual_command: bool = False,
 ) -> None:
     if "twist" not in env_cfg.commands:
         return
@@ -158,6 +165,9 @@ def _configure_command_ranges(
         twist_cmd.rel_heading_envs = 0.0
     if hasattr(twist_cmd, "init_velocity_prob"):
         twist_cmd.init_velocity_prob = 0.0
+    if manual_command and hasattr(twist_cmd, "resampling_time_range"):
+        # Keep the command under GUI control instead of periodically replacing it.
+        twist_cmd.resampling_time_range = (1.0e9, 1.0e9)
 
 
 def _force_fixed_command(env: Any, fixed_command: tuple[float, float, float] | None) -> None:
@@ -176,11 +186,44 @@ def _force_fixed_command(env: Any, fixed_command: tuple[float, float, float] | N
         command.is_heading_env[:] = False
 
 
+def _manual_gui_command(env: Any) -> tuple[float, float, float]:
+    """Return the Viser slider command, or zero while manual control is disabled."""
+
+    try:
+        command = env.unwrapped.command_manager.get_term("twist")
+    except Exception:
+        return (0.0, 0.0, 0.0)
+
+    enabled = getattr(command, "_joystick_enabled", None)
+    sliders = getattr(command, "_joystick_sliders", ())
+    if enabled is None or not bool(enabled.value) or len(sliders) < 3:
+        return (0.0, 0.0, 0.0)
+    return tuple(float(slider.value) for slider in sliders[:3])
+
+
 def _resolve_viewer(viewer: Literal["auto", "native", "viser"]) -> Literal["native", "viser"]:
     if viewer != "auto":
         return viewer
     has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
     return "native" if has_display else "viser"
+
+
+def _run_viewer(
+    resolved_viewer: Literal["native", "viser"],
+    wrapped_env: Any,
+    policy: Any,
+    frame_rate: float,
+    viser_port: int,
+) -> None:
+    if resolved_viewer == "native":
+        NativeMujocoViewer(wrapped_env, policy, frame_rate=frame_rate).run()
+        return
+    if not 1 <= viser_port <= 65535:
+        raise ValueError(f"viser_port must be in [1, 65535], got {viser_port}.")
+    import viser
+
+    server = viser.ViserServer(port=viser_port, label="mjlab")
+    ViserPlayViewer(wrapped_env, policy, frame_rate=frame_rate, viser_server=server).run()
 
 
 class FlashSACPolicyAdapter:
@@ -192,6 +235,7 @@ class FlashSACPolicyAdapter:
         command_sequence: list[tuple[float, float, float]],
         command_switch_steps: int,
         random_command: bool,
+        manual_command: bool,
         random_ranges: tuple[tuple[float, float], tuple[float, float], tuple[float, float]],
         random_stand_prob: float,
         env: Any,
@@ -206,6 +250,7 @@ class FlashSACPolicyAdapter:
         self.command_sequence = command_sequence
         self.command_switch_steps = max(1, int(command_switch_steps))
         self.random_command = random_command
+        self.manual_command = bool(manual_command)
         self.random_ranges = random_ranges
         self.random_stand_prob = float(random_stand_prob)
         self.env = env
@@ -217,6 +262,8 @@ class FlashSACPolicyAdapter:
         self.sampled_command: tuple[float, float, float] | None = None
 
     def _current_command(self) -> tuple[float, float, float] | None:
+        if self.manual_command:
+            return _manual_gui_command(self.env)
         if self.random_command:
             if self.sampled_command is None or self.step_count % self.command_switch_steps == 0:
                 if random.random() < self.random_stand_prob:
@@ -282,6 +329,10 @@ def main() -> None:
     set_seed(args.seed)
     fixed_command = tuple(args.fixed_command) if args.fixed_command is not None else None
     command_sequence = _parse_command_sequence(args.command_sequence)
+    if args.manual_command and (fixed_command is not None or command_sequence or args.random_command):
+        raise ValueError(
+            "--manual_command cannot be combined with --fixed_command, --command_sequence, or --random_command."
+        )
     random_ranges = (
         tuple(args.random_lin_vel_x),
         tuple(args.random_lin_vel_y),
@@ -314,11 +365,12 @@ def main() -> None:
         env_cfg,
         fixed_command,
         command_sequence,
-        random_ranges=random_ranges if args.random_command else None,
+        random_ranges=random_ranges if (args.random_command or args.manual_command) else None,
+        manual_command=bool(args.manual_command),
     )
 
     env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
-    _force_fixed_command(env, fixed_command)
+    _force_fixed_command(env, (0.0, 0.0, 0.0) if args.manual_command else fixed_command)
     actor_dim = int(env.single_observation_space.spaces["actor"].shape[0])
     full_action_dim = int(env.single_action_space.shape[0])
     if actor_dim != 48:
@@ -340,7 +392,7 @@ def main() -> None:
     agent.load(str(checkpoint_path))
 
     wrapped_env = RslRlVecEnvWrapper(env, clip_actions=1.0)
-    _force_fixed_command(wrapped_env, fixed_command)
+    _force_fixed_command(wrapped_env, (0.0, 0.0, 0.0) if args.manual_command else fixed_command)
     policy = FlashSACPolicyAdapter(
         agent=agent,
         device=device,
@@ -348,6 +400,7 @@ def main() -> None:
         command_sequence=command_sequence,
         command_switch_steps=args.command_switch_steps,
         random_command=bool(args.random_command),
+        manual_command=bool(args.manual_command),
         random_ranges=random_ranges,
         random_stand_prob=args.random_stand_prob,
         env=wrapped_env,
@@ -370,6 +423,8 @@ def main() -> None:
     )
     if fixed_command is not None:
         print(f"[Go2-FlashSAC-RWM-Play] fixed_command={fixed_command}")
+    if args.manual_command:
+        print("[Go2-FlashSAC-RWM-Play] manual_command=True, initial_command=(0.0, 0.0, 0.0)")
     if command_sequence:
         print(
             "[Go2-FlashSAC-RWM-Play] command_sequence="
@@ -382,10 +437,7 @@ def main() -> None:
             f"stand_prob={args.random_stand_prob}"
         )
 
-    if resolved_viewer == "native":
-        NativeMujocoViewer(wrapped_env, policy, frame_rate=args.frame_rate).run()
-    else:
-        ViserPlayViewer(wrapped_env, policy, frame_rate=args.frame_rate).run()
+    _run_viewer(resolved_viewer, wrapped_env, policy, args.frame_rate, args.viser_port)
     wrapped_env.close()
 
 

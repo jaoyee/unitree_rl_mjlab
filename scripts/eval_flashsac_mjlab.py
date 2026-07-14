@@ -83,12 +83,19 @@ def _load_eval_config(args: argparse.Namespace):
     return _compose_config(args.config_path, args.config_name, args.overrides), checkpoint_path
 
 
-def _configure_clean_eval(env_cfg: Any) -> None:
+def _configure_clean_eval(
+    env_cfg: Any,
+    *,
+    payload_mass_kg: float = 0.0,
+    rr_calf_strength: float = 1.0,
+) -> None:
     configure_mjlab_randomization(
         env_cfg,
         use_domain_randomization=False,
         use_push_randomization=False,
         use_observation_noise=False,
+        payload_mass_range_kg=(payload_mass_kg, payload_mass_kg),
+        rr_calf_strength_range=(rr_calf_strength, rr_calf_strength),
     )
     if hasattr(env_cfg, "curriculum"):
         env_cfg.curriculum = {}
@@ -194,6 +201,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--clean", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--fixed_command", type=float, nargs=3, metavar=("VX", "VY", "YAW"), default=None)
     parser.add_argument("--broken_joint_names", nargs="*", default=None)
+    parser.add_argument("--payload_mass_kg", type=float, default=0.0)
+    parser.add_argument("--rr_calf_strength", type=float, default=1.0)
     parser.add_argument("--output_json", type=str, default=None)
     return parser.parse_args()
 
@@ -227,7 +236,11 @@ def main() -> None:
     env_cfg.auto_reset = True
     apply_mjlab_env_overrides(env_cfg, cfg)
     if args.clean:
-        _configure_clean_eval(env_cfg)
+        _configure_clean_eval(
+            env_cfg,
+            payload_mass_kg=args.payload_mass_kg,
+            rr_calf_strength=args.rr_calf_strength,
+        )
     _configure_fixed_command_range(env_cfg, fixed_command)
 
     joint_strength_scales = {

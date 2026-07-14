@@ -77,6 +77,8 @@ class _FlashSACPolicy:
         use_critic_observation_as_full_observation: bool,
         full_action_dim: int,
         action_mask_indices: tuple[int, ...],
+        manual_command: bool = False,
+        env: Any | None = None,
     ) -> None:
         self._agent = agent
         self._device = device
@@ -84,8 +86,30 @@ class _FlashSACPolicy:
         self._use_critic_observation_as_full_observation = use_critic_observation_as_full_observation
         self._full_action_dim = full_action_dim
         self._action_mask_indices = action_mask_indices
+        self._manual_command = manual_command
+        self._env = env
+
+    def _apply_manual_command(self, obs_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        if not self._manual_command or self._env is None:
+            return obs_dict
+        from scripts.reinforcement_learning.rwm_flashsac import play_flashsac_go2_mjlab as viewer_helpers
+
+        command = viewer_helpers._manual_gui_command(self._env)
+        viewer_helpers._force_fixed_command(self._env, command)
+        actor = obs_dict["actor"].clone()
+        actor_dim = int(actor.shape[-1])
+        command_start = 6 if actor_dim == 45 else 9
+        actor[:, command_start : command_start + 3] = torch.tensor(
+            command,
+            dtype=actor.dtype,
+            device=actor.device,
+        )
+        updated = dict(obs_dict)
+        updated["actor"] = actor
+        return updated
 
     def __call__(self, obs_dict: dict[str, torch.Tensor]) -> torch.Tensor:
+        obs_dict = self._apply_manual_command(obs_dict)
         if self._has_critic_obs and self._use_critic_observation_as_full_observation:
             flat = obs_dict["critic"]
         elif self._has_critic_obs:
@@ -171,16 +195,30 @@ def play(args: argparse.Namespace) -> None:
     import src.tasks  # noqa: F401
     from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
     from mjlab.tasks.registry import load_env_cfg
+    from scripts.reinforcement_learning.rwm_flashsac import play_flashsac_go2_mjlab as viewer_helpers
 
     env_cfg = load_env_cfg(cfg.env.env_name, play=True)
     env_cfg.scene.num_envs = args.num_envs
     env_cfg.seed = cfg.seed
     env_cfg.auto_reset = True
     apply_mjlab_env_overrides(env_cfg, cfg)
+    if args.manual_command:
+        viewer_helpers._configure_command_ranges(
+            env_cfg,
+            fixed_command=None,
+            command_sequence=[],
+            random_ranges=(
+                tuple(args.manual_lin_vel_x),
+                tuple(args.manual_lin_vel_y),
+                tuple(args.manual_ang_vel_z),
+            ),
+            manual_command=True,
+        )
     joint_strength_scales = {
         str(name): float(scale)
         for name, scale in (cfg.env.get("joint_strength_scales", {}) or {}).items()
     }
+    joint_strength_scales.update(viewer_helpers._parse_joint_strength_scales(args.joint_strength_scales))
     broken_joint_names = tuple(cfg.env.get("broken_joint_names", []) or ())
     for joint_name in broken_joint_names:
         joint_strength_scales[str(joint_name)] = 0.0
@@ -197,6 +235,8 @@ def play(args: argparse.Namespace) -> None:
 
     render_mode = "rgb_array" if args.video else None
     raw_env = ManagerBasedRlEnv(cfg=env_cfg, device=device, render_mode=render_mode)
+    if args.manual_command:
+        viewer_helpers._force_fixed_command(raw_env, (0.0, 0.0, 0.0))
 
     env: Any = raw_env
     if args.video:
@@ -256,6 +296,8 @@ def play(args: argparse.Namespace) -> None:
         use_critic_observation_as_full_observation=use_critic_observation_as_full_observation,
         full_action_dim=full_action_dim,
         action_mask_indices=action_mask_indices,
+        manual_command=args.manual_command,
+        env=viewer_env,
     )
 
     env.reset()
@@ -277,11 +319,13 @@ def play(args: argparse.Namespace) -> None:
     elif viewer_type == "native":
         from mjlab.viewer import NativeMujocoViewer
 
-        NativeMujocoViewer(viewer_env, policy).run()
+        NativeMujocoViewer(viewer_env, policy, frame_rate=args.frame_rate).run()
     elif viewer_type == "viser":
+        import viser
         from mjlab.viewer import ViserPlayViewer
 
-        ViserPlayViewer(viewer_env, policy).run()
+        server = viser.ViserServer(port=args.viser_port, label="mjlab")
+        ViserPlayViewer(viewer_env, policy, frame_rate=args.frame_rate, viser_server=server).run()
     else:
         raise ValueError(f"Unknown viewer: {viewer_type!r}")
 
@@ -298,6 +342,13 @@ if __name__ == "__main__":
     parser.add_argument("--num_envs", type=int, default=4)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--viewer", type=str, default="auto", choices=["auto", "native", "viser", "none"])
+    parser.add_argument("--frame_rate", type=float, default=60.0)
+    parser.add_argument("--viser_port", type=int, default=8080)
+    parser.add_argument("--manual_command", action="store_true")
+    parser.add_argument("--manual_lin_vel_x", type=float, nargs=2, default=(-0.5, 0.5))
+    parser.add_argument("--manual_lin_vel_y", type=float, nargs=2, default=(-0.2, 0.2))
+    parser.add_argument("--manual_ang_vel_z", type=float, nargs=2, default=(-0.4, 0.4))
+    parser.add_argument("--joint_strength_scales", nargs="*", default=(), metavar="JOINT=SCALE")
     parser.add_argument("--num_steps", type=int, default=1000)
     parser.add_argument("--video", type=str, default=None, metavar="OUTPUT_DIR")
     play(parser.parse_args())

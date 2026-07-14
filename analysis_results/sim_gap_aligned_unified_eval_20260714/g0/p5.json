@@ -1,0 +1,78 @@
+{
+  "checkpoint_path": "/root/unitree_rl_mjlab_normal_fixstand_v2/logs/experiments/go2_sim_gap_aligned/20260714_aligned_g0d0_v1/g0/final_policy_rwm_p0/run/step48828",
+  "task": "Unitree-Go2-Flat-Normal-FixStand-RWM-Pretrain-Ens",
+  "seed": 400,
+  "steps": 2400,
+  "num_envs": 256,
+  "clean": true,
+  "randomization_preset": "clean",
+  "randomization_components": [],
+  "randomization_scale": 0.0,
+  "payload_mass_kg": 5.0,
+  "rr_calf_strength": 1.0,
+  "joint_strength_scales": {},
+  "command_sequence": [
+    [
+      0.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.5,
+      0.0,
+      0.0
+    ],
+    [
+      -0.4,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      0.25,
+      0.0
+    ],
+    [
+      0.0,
+      -0.25,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      0.5
+    ],
+    [
+      0.0,
+      0.0,
+      -0.5
+    ],
+    [
+      0.4,
+      0.2,
+      0.3
+    ]
+  ],
+  "command_switch_steps": 300,
+  "mean_return": 10.63452049032806,
+  "std_return": 23.85263185299988,
+  "mean_episode_length": 276.03537618335827,
+  "completed_episodes": 2007,
+  "terminated_count": 2007,
+  "timeout_count": 0,
+  "non_timeout_termination_count": 2007,
+  "command_x": 0.0625,
+  "command_y": 0.02500000409781933,
+  "command_yaw": 0.03749999776482582,
+  "base_lin_vel_x": 0.04041960835456848,
+  "base_lin_vel_y": 0.02510477602481842,
+  "base_speed_xy": 0.1840968281030655,
+  "base_yaw_vel": -0.0006035612314008176,
+  "error_vel_xy": 0.08690205961465836,
+  "error_vel_yaw": 0.0875297337770462,
+  "action_abs_mean": 0.44490511699890095,
+  "Episode_Termination/fell_over": 0.0,
+  "Episode_Termination/illegal_contact": 1.5620833333333333,
+  "Metrics/twist/error_vel_xy": 0.06920166244419912,
+  "Metrics/twist/error_vel_yaw": 0.04167245071691771
+}

@@ -184,6 +184,15 @@ class ProprioceptiveSystemDynamicsEnsemble(nn.Module):
             # supervision content without also reducing the optimizer signal.
             state_loss_weights *= float(cfg.output_state_dim) / float(active_dims)
         self.register_buffer("state_loss_weights", state_loss_weights)
+        base_lin_vel_output_positions = [
+            output_state_indices.index(full_idx)
+            for full_idx in (0, 1, 2)
+            if full_idx in output_state_indices
+        ]
+        self.register_buffer(
+            "base_lin_vel_output_positions_t",
+            torch.tensor(base_lin_vel_output_positions, dtype=torch.long),
+        )
         self.members = nn.ModuleList([_ProprioceptiveDynamicsMember(cfg) for _ in range(cfg.ensemble_size)])
         self.register_buffer("input_state_mean", torch.zeros(cfg.input_state_dim))
         self.register_buffer("input_state_std", torch.ones(cfg.input_state_dim))
@@ -332,6 +341,7 @@ class ProprioceptiveSystemDynamicsEnsemble(nn.Module):
         next_states: torch.Tensor,
         contacts: torch.Tensor,
         terminations: torch.Tensor,
+        base_lin_vel_confidence: torch.Tensor | None,
         bootstrap: bool,
     ) -> dict[str, torch.Tensor]:
         h = self.cfg.history_horizon
@@ -352,6 +362,11 @@ class ProprioceptiveSystemDynamicsEnsemble(nn.Module):
             ns = next_states[batch_indices]
             c = contacts[batch_indices]
             t = terminations[batch_indices]
+            velocity_confidence = (
+                None
+                if base_lin_vel_confidence is None
+                else base_lin_vel_confidence[batch_indices].float().clamp(0.0, 1.0)
+            )
 
             input_state = self.reduce_state(s[:, :h])
             action_input = a[:, :h]
@@ -381,8 +396,13 @@ class ProprioceptiveSystemDynamicsEnsemble(nn.Module):
                 target = self.normalize_output_state(ns[:, target_idx])
                 pred_sample = torch.randn_like(mean) * torch.exp(logstd) + mean
                 squared_error = (pred_sample - target).square()
+                loss_weights = self.state_loss_weights.unsqueeze(0).expand_as(squared_error)
+                if velocity_confidence is not None and self.base_lin_vel_output_positions_t.numel() > 0:
+                    loss_weights = loss_weights.clone()
+                    confidence_t = velocity_confidence[:, target_idx].reshape(-1, 1)
+                    loss_weights[:, self.base_lin_vel_output_positions_t] *= confidence_t
                 state_loss_member = state_loss_member + torch.sum(
-                    squared_error * self.state_loss_weights,
+                    squared_error * loss_weights,
                     dim=-1,
                 ).mean()
                 bound_loss_member = bound_loss_member + self._compute_bound_loss(raw_logstd)
@@ -423,9 +443,18 @@ class ProprioceptiveSystemDynamicsEnsemble(nn.Module):
         next_states: torch.Tensor,
         contacts: torch.Tensor,
         terminations: torch.Tensor,
+        base_lin_vel_confidence: torch.Tensor | None = None,
         bootstrap: bool = True,
     ) -> dict[str, torch.Tensor]:
-        losses = self._compute_reference_autoregressive_loss(states, actions, next_states, contacts, terminations, bootstrap)
+        losses = self._compute_reference_autoregressive_loss(
+            states,
+            actions,
+            next_states,
+            contacts,
+            terminations,
+            base_lin_vel_confidence,
+            bootstrap,
+        )
         total_loss = (
             self.cfg.state_loss_weight * losses["state_loss"]
             + self.cfg.sequence_loss_weight * losses["sequence_loss"]

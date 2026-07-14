@@ -163,6 +163,7 @@ def _train_with_micro_batches(
     batch_size: int,
     micro_batch_size: int,
     device: torch.device,
+    include_base_lin_vel_confidence: bool = False,
 ) -> dict[str, float]:
     """Train one effective batch while bounding GRU activation memory."""
 
@@ -176,7 +177,12 @@ def _train_with_micro_batches(
         current = min(micro_batch_size, int(batch_size) - processed)
         if current <= 0:
             break
-        batch = sampler.sample(current, device=device, split="train")
+        batch = sampler.sample(
+            current,
+            device=device,
+            split="train",
+            include_base_lin_vel_confidence=include_base_lin_vel_confidence,
+        )
         loss_dict = dynamics.compute_loss(*batch, bootstrap=True)
         scale = float(current) / float(batch_size)
         (loss_dict["total_loss"] * scale).backward()

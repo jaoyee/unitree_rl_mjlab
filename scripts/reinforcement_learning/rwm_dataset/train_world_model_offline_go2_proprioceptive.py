@@ -118,6 +118,17 @@ def main() -> None:
 
     dataset_path = resolve_repo_path(str(cfg.dataset_path))
     dataset = load_mixed_dataset(dataset_path)
+    dataset_metadata = dataset.get("metadata") or {}
+    if bool(dataset_metadata.get("base_lin_vel_supervised", False)):
+        ignored_velocity_indices = sorted(
+            set(state_loss_ignored_indices) & set(GO2_BASE_LIN_VEL_STATE_INDICES)
+        )
+        if ignored_velocity_indices:
+            raise ValueError(
+                "Dataset provides supervised base_lin_vel estimates, but the training config "
+                f"ignores indices {ignored_velocity_indices}. Set "
+                "system_dynamics.state_loss_ignored_indices=[] for this dataset."
+            )
     action_mask_indices = normalize_action_mask_indices(cfg.get("action_mask_indices", []))
     action_mask_indices = mask_dataset_actions(dataset, action_mask_indices)
     sampler_cfg = OfflineSamplerConfig(
@@ -218,6 +229,7 @@ def main() -> None:
             batch_size=int(cfg.batch_size),
             micro_batch_size=int(cfg.micro_batch_size),
             device=device,
+            include_base_lin_vel_confidence=True,
         )
 
         latest_metrics = {
@@ -238,7 +250,12 @@ def main() -> None:
             dynamics.eval()
             with torch.no_grad():
                 eval_batch_size = min(int(cfg.batch_size), int(cfg.micro_batch_size))
-                eval_batch = sampler.sample(eval_batch_size, device=device, split="val")
+                eval_batch = sampler.sample(
+                    eval_batch_size,
+                    device=device,
+                    split="val",
+                    include_base_lin_vel_confidence=True,
+                )
                 eval_loss = dynamics.compute_loss(*eval_batch, bootstrap=False)
                 available_rollout = max(1, sampler.num_time_steps - dynamics.cfg.history_horizon)
                 rollout_horizon = min(100, available_rollout)

@@ -25,6 +25,13 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from scripts.reinforcement_learning.rwm_dataset.go2_contact_velocity_estimator import (
+    GO2_CONTACT_VELOCITY_AFFINE_BIAS,
+    GO2_CONTACT_VELOCITY_AFFINE_MATRIX,
+    GO2_LEG_ORDER,
+    Go2ContactVelocityEstimator,
+)
+
 
 STATE_DIM = 45
 ACTION_DIM = 12
@@ -37,7 +44,12 @@ SDK_JOINT_NAMES = (
     "RR_hip_joint", "RR_thigh_joint", "RR_calf_joint",
     "RL_hip_joint", "RL_thigh_joint", "RL_calf_joint",
 )
-CONTACT_NAMES = ("FR", "FL", "RR", "RL")
+SDK_CONTACT_NAMES = ("FR", "FL", "RR", "RL")
+DATASET_CONTACT_NAMES = ("FR", "FL", "RR", "RL")
+ESTIMATOR_CONTACT_NAMES = GO2_LEG_ORDER
+CONTACT_DATASET_TO_ESTIMATOR = tuple(
+    DATASET_CONTACT_NAMES.index(name) for name in ESTIMATOR_CONTACT_NAMES
+)
 
 
 @dataclass(frozen=True)
@@ -68,6 +80,8 @@ class LoggedRow:
     contact: torch.Tensor
     action_source: str
     exact_policy_observation: bool
+    base_lin_vel_confidence: float = 0.0
+    base_lin_vel_raw: torch.Tensor | None = None
 
 
 def _parse_args() -> argparse.Namespace:
@@ -79,6 +93,20 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-gap-seconds", type=float, default=0.06)
     parser.add_argument("--max-action-alignment-error", type=float, default=1e-3)
     parser.add_argument("--contact-force-threshold", type=float, default=10.0)
+    parser.add_argument("--velocity-estimator-ema-alpha", type=float, default=0.35)
+    parser.add_argument("--velocity-estimator-consensus-threshold", type=float, default=0.12)
+    parser.add_argument(
+        "--minimum-velocity-confidence-fraction",
+        type=float,
+        default=0.5,
+        help="Reject a dataset when too few transitions have a stance-foot velocity estimate.",
+    )
+    parser.add_argument(
+        "--velocity-estimator-sim-calibration",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Apply the affine contact-velocity calibration fitted on MJLab trajectories.",
+    )
     parser.add_argument(
         "--allow-legacy-reconstruction",
         action="store_true",
@@ -113,9 +141,20 @@ def _load_deploy_spec(path: Path) -> DeploySpec:
         tuple(float(v) for v in ranges[key])
         for key in ("lin_vel_x", "lin_vel_y", "ang_vel_z")
     )
+    joint_names = tuple(SDK_JOINT_NAMES[idx] for idx in joint_ids_map)
+    expected_joint_names = tuple(
+        f"{leg}_{joint}_joint"
+        for leg in ESTIMATOR_CONTACT_NAMES
+        for joint in ("hip", "thigh", "calf")
+    )
+    if joint_names != expected_joint_names:
+        raise ValueError(
+            "contact-velocity estimation requires policy joint order FL, FR, RL, RR; "
+            f"deploy.yaml resolves to {joint_names}"
+        )
     return DeploySpec(
         joint_ids_map=joint_ids_map,
-        joint_names=tuple(SDK_JOINT_NAMES[idx] for idx in joint_ids_map),
+        joint_names=joint_names,
         default_joint_pos=default_joint_pos,
         action_scale=action_scale,
         action_offset=action_offset,
@@ -283,10 +322,10 @@ def _parse_logged_row(
         observation[:] = torch.tensor(ang_vel + gravity + command + q_rel + dq + [0.0] * 12)
 
     if _has_vector(fieldnames, "foot_contact", CONTACT_DIM):
-        contact = _vector(row, "foot_contact", CONTACT_DIM)
+        contact_sdk = _vector(row, "foot_contact", CONTACT_DIM)
     else:
         force = _vector(row, "foot_force", CONTACT_DIM)
-        contact = [float(value > args.contact_force_threshold) for value in force]
+        contact_sdk = [float(value > args.contact_force_threshold) for value in force]
 
     policy_state = _optional_float(row, "policy_state_id")
     episode_step = _optional_float(row, "episode_step")
@@ -305,7 +344,7 @@ def _parse_logged_row(
         raw_action=raw_action,
         observation=observation,
         command=torch.tensor(command, dtype=torch.float32),
-        contact=torch.tensor(contact, dtype=torch.float32),
+        contact=torch.tensor(contact_sdk, dtype=torch.float32),
         action_source=action_source,
         exact_policy_observation=has_policy_obs,
     )
@@ -377,13 +416,44 @@ def _append(dataset: dict[str, Any], key: str, value: torch.Tensor) -> None:
     dataset[key].append(value.unsqueeze(0))
 
 
+def _estimate_base_lin_velocities(
+    rows: list[LoggedRow],
+    spec: DeploySpec,
+    args: argparse.Namespace,
+) -> None:
+    estimator = Go2ContactVelocityEstimator(
+        ema_alpha=float(args.velocity_estimator_ema_alpha),
+        consensus_threshold=float(args.velocity_estimator_consensus_threshold),
+        use_sim_calibration=bool(args.velocity_estimator_sim_calibration),
+    )
+    default_joint_pos = torch.tensor(spec.default_joint_pos, dtype=torch.float32)
+    for idx, row in enumerate(rows):
+        if idx == 0 or _is_boundary(rows[idx - 1], row, args.max_gap_seconds):
+            estimator.reset()
+        joint_pos = (row.state[9:21] + default_joint_pos).unsqueeze(0)
+        joint_vel = row.state[21:33].unsqueeze(0)
+        base_ang_vel = row.state[3:6].unsqueeze(0)
+        contact = row.contact[list(CONTACT_DATASET_TO_ESTIMATOR)].unsqueeze(0)
+        velocity, confidence, raw = estimator.update(
+            joint_pos,
+            joint_vel,
+            base_ang_vel,
+            contact,
+        )
+        row.state[0:3] = velocity[0]
+        row.base_lin_vel_confidence = float(confidence[0])
+        row.base_lin_vel_raw = raw[0].clone()
+
+
 def _build_dataset(rows: list[LoggedRow], spec: DeploySpec, args: argparse.Namespace) -> dict[str, Any]:
+    _estimate_base_lin_velocities(rows, spec, args)
     list_keys = (
         "states", "actions", "raw_actions", "env_action_delay_steps",
         "actuator_delay_substeps", "next_states", "contacts", "terminations",
         "observations", "next_observations", "commands", "rewards", "dones",
         "timeouts", "prev_actions", "episode_ids", "timesteps", "collector_types",
-        "noisy_actor_observations",
+        "noisy_actor_observations", "base_lin_vel_confidence",
+        "next_base_lin_vel_confidence", "base_lin_vel_raw",
     )
     dataset: dict[str, Any] = {key: [] for key in list_keys}
     dataset.update(
@@ -444,6 +514,19 @@ def _build_dataset(rows: list[LoggedRow], spec: DeploySpec, args: argparse.Names
         _append(dataset, "episode_ids", torch.tensor(episode_id, dtype=torch.long))
         _append(dataset, "timesteps", torch.tensor(timestep, dtype=torch.long))
         _append(dataset, "collector_types", torch.tensor(1, dtype=torch.long))
+        _append(
+            dataset,
+            "base_lin_vel_confidence",
+            torch.tensor(current.base_lin_vel_confidence, dtype=torch.float32),
+        )
+        _append(
+            dataset,
+            "next_base_lin_vel_confidence",
+            torch.tensor(following.base_lin_vel_confidence, dtype=torch.float32),
+        )
+        if current.base_lin_vel_raw is None:
+            raise RuntimeError("base velocity estimator did not populate raw velocity")
+        _append(dataset, "base_lin_vel_raw", current.base_lin_vel_raw)
 
         approximate_rows += int(not current.exact_policy_observation or current.action_source == "q_des_inverse")
         episode_ids_seen.add(episode_id)
@@ -455,6 +538,18 @@ def _build_dataset(rows: list[LoggedRow], spec: DeploySpec, args: argparse.Names
     if transitions < args.minimum_transitions:
         raise ValueError(f"only {transitions} valid transitions; require {args.minimum_transitions}")
     dataset["capacity"] = transitions
+    velocity_confidence = torch.stack(dataset["base_lin_vel_confidence"]).float()
+    estimated_velocity = torch.stack(dataset["states"])[..., 0:3].float()
+    confidence_nonzero_fraction = float((velocity_confidence > 0.0).float().mean())
+    minimum_confidence_fraction = float(args.minimum_velocity_confidence_fraction)
+    if not 0.0 <= minimum_confidence_fraction <= 1.0:
+        raise ValueError("minimum_velocity_confidence_fraction must be in [0, 1]")
+    if confidence_nonzero_fraction < minimum_confidence_fraction:
+        raise ValueError(
+            "insufficient contact-velocity coverage: "
+            f"{confidence_nonzero_fraction:.3%} of transitions have a valid estimate, "
+            f"require at least {minimum_confidence_fraction:.3%}"
+        )
     dataset["metadata"] = {
         "obs_dim": OBS_DIM,
         "source": "real_go2_csv",
@@ -468,8 +563,33 @@ def _build_dataset(rows: list[LoggedRow], spec: DeploySpec, args: argparse.Names
             "base_lin_vel_b[3]", "base_ang_vel_b[3]", "projected_gravity_b[3]",
             "joint_pos_rel[12]", "joint_vel[12]", "actuator_force[12]",
         ],
-        "state_loss_ignored_indices": list(BASE_LIN_VEL_INDICES),
-        "base_lin_vel_source": "zero_placeholder_unsupervised",
+        "state_loss_ignored_indices": [],
+        "state_label_kind": "measured_state_with_estimated_base_lin_vel",
+        "base_lin_vel_state_indices": list(BASE_LIN_VEL_INDICES),
+        "base_lin_vel_source": "contact_kinematics_affine_ema_estimate",
+        "base_lin_vel_supervised": True,
+        "base_lin_vel_estimator": {
+            "leg_order": list(ESTIMATOR_CONTACT_NAMES),
+            "dataset_contact_order": list(DATASET_CONTACT_NAMES),
+            "sdk_contact_order": list(SDK_CONTACT_NAMES),
+            "ema_alpha": float(args.velocity_estimator_ema_alpha),
+            "consensus_threshold": float(args.velocity_estimator_consensus_threshold),
+            "sim_calibration": bool(args.velocity_estimator_sim_calibration),
+            "affine_matrix": (
+                [list(row) for row in GO2_CONTACT_VELOCITY_AFFINE_MATRIX]
+                if args.velocity_estimator_sim_calibration
+                else None
+            ),
+            "affine_bias": (
+                list(GO2_CONTACT_VELOCITY_AFFINE_BIAS)
+                if args.velocity_estimator_sim_calibration
+                else None
+            ),
+            "confidence_mean": float(velocity_confidence.mean()),
+            "confidence_nonzero_fraction": confidence_nonzero_fraction,
+            "minimum_confidence_fraction": minimum_confidence_fraction,
+            "estimate_abs_max": float(estimated_velocity.abs().max()),
+        },
         "policy_observation_kind": "proprioceptive_45d",
         "policy_observation_layout": [
             "base_ang_vel_b[3]", "projected_gravity_b[3]", "command[3]",
@@ -478,7 +598,8 @@ def _build_dataset(rows: list[LoggedRow], spec: DeploySpec, args: argparse.Names
         "joint_ids_map": list(spec.joint_ids_map),
         "joint_names": list(spec.joint_names),
         "sdk_joint_names": list(SDK_JOINT_NAMES),
-        "contact_names": list(CONTACT_NAMES),
+        "contact_names": list(DATASET_CONTACT_NAMES),
+        "sdk_contact_names": list(SDK_CONTACT_NAMES),
         "step_dt": spec.step_dt,
         "measured_dt_mean": sum(dt_values) / len(dt_values),
         "measured_dt_min": min(dt_values),
@@ -511,6 +632,8 @@ def _validate_dataset(dataset: dict[str, Any]) -> dict[str, Any]:
         "states": (1, 45), "actions": (1, 12), "next_states": (1, 45),
         "contacts": (1, 4), "terminations": (1, 1),
         "observations": (1, 45), "next_observations": (1, 45),
+        "base_lin_vel_confidence": (1,), "next_base_lin_vel_confidence": (1,),
+        "base_lin_vel_raw": (1, 3),
     }
     for key, shape in expected_shapes.items():
         if tuple(dataset[key][0].shape) != shape:

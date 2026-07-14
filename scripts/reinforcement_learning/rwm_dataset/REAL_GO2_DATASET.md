@@ -2,8 +2,9 @@
 
 The formal real-robot dataset path uses the same
 `go2_mixed_rwm_dataset_v2` container as simulation. It keeps the 45D state
-interface but sets `base_lin_vel_b[0:3]` to zero placeholders. Training must
-use `system_dynamics.state_loss_ignored_indices=[0,1,2]`.
+interface and estimates `base_lin_vel_b[0:3]` from stance-foot kinematics,
+joint velocity, and body angular velocity. These estimated labels remain in
+the world-model loss while the proprioceptive RWM input stays 42D.
 
 ## 1. Build the updated deployment logger
 
@@ -43,7 +44,9 @@ The command also writes `dataset.json`. Formal data must report:
 
 - `conversion_kind: exact`
 - `state_dim: 45`, `action_dim: 12`, `contact_dim: 4`
-- `base_lin_vel_source: zero_placeholder_unsupervised`
+- `base_lin_vel_source: contact_kinematics_affine_ema_estimate`
+- `base_lin_vel_supervised: true`
+- `base_lin_vel_estimator.confidence_nonzero_fraction >= 0.5`
 - a small `max_next_obs_action_alignment_error` (default limit `1e-3`)
 - no unexpected rejected rows
 
@@ -56,8 +59,19 @@ Point the offline world-model config at the generated `dataset.pt` and keep:
 
 ```yaml
 system_dynamics:
-  state_loss_ignored_indices: [0, 1, 2]
+  dropped_state_indices: [0, 1, 2]
+  state_loss_ignored_indices: []
 ```
+
+`dropped_state_indices` preserves the 42D proprioceptive input. An empty
+`state_loss_ignored_indices` keeps all 45 output dimensions, including the
+estimated base velocity, under supervision.
+
+The proprioceptive trainer reads `next_base_lin_vel_confidence` and applies it
+only to output dimensions `[0, 1, 2]`: confidence `1.0` gives full velocity
+supervision, `0.5` gives half weight, and `0.0` masks the velocity label for
+that target frame. All other state, contact, and termination losses remain
+active. Simulator datasets without this field default to confidence `1.0`.
 
 The converter executes the existing 32-step-history plus 8-step-forecast
 sampler before saving, so a successful strict conversion is directly readable

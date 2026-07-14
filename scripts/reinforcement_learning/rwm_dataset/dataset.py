@@ -235,14 +235,44 @@ class OfflineSequenceSampler:
         self.next_states = stack_time_key(dataset, "next_states").float()
         self.contacts = stack_time_key(dataset, "contacts").float()
         self.terminations = stack_time_key(dataset, "terminations").float()
+        self.num_time_steps = int(self.states.shape[0])
+        self.num_envs = int(self.states.shape[1])
+        confidence_values = dataset.get("next_base_lin_vel_confidence")
+        if confidence_values is None:
+            self.next_base_lin_vel_confidence = torch.ones(
+                self.num_time_steps,
+                self.num_envs,
+                dtype=torch.float32,
+            )
+            self.has_base_lin_vel_confidence = False
+        else:
+            self.next_base_lin_vel_confidence = stack_time_key(
+                dataset, "next_base_lin_vel_confidence"
+            ).float()
+            if (
+                self.next_base_lin_vel_confidence.ndim == 3
+                and self.next_base_lin_vel_confidence.shape[-1] == 1
+            ):
+                self.next_base_lin_vel_confidence = self.next_base_lin_vel_confidence.squeeze(-1)
+            expected_confidence_shape = (self.num_time_steps, self.num_envs)
+            if tuple(self.next_base_lin_vel_confidence.shape) != expected_confidence_shape:
+                raise ValueError(
+                    "next_base_lin_vel_confidence shape is "
+                    f"{tuple(self.next_base_lin_vel_confidence.shape)}, "
+                    f"expected {expected_confidence_shape}"
+                )
+            if not torch.all(
+                (self.next_base_lin_vel_confidence >= 0.0)
+                & (self.next_base_lin_vel_confidence <= 1.0)
+            ):
+                raise ValueError("next_base_lin_vel_confidence must be in [0, 1]")
+            self.has_base_lin_vel_confidence = True
         episode_values = dataset.get("episode_ids")
         self.episode_ids = (
             stack_time_key(dataset, "episode_ids").long()
             if episode_values is not None
             else None
         )
-        self.num_time_steps = int(self.states.shape[0])
-        self.num_envs = int(self.states.shape[1])
         self.state_dim = int(self.states.shape[-1])
         self.action_dim = int(self.actions.shape[-1])
         self.contact_dim = int(self.contacts.shape[-1])
@@ -333,7 +363,8 @@ class OfflineSequenceSampler:
         device: torch.device | str,
         split: str = "train",
         forecast_horizon: int | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        include_base_lin_vel_confidence: bool = False,
+    ) -> tuple[torch.Tensor, ...]:
         indices = self.train_indices if split == "train" else self.val_indices
         if indices.numel() == 0:
             indices = self.train_indices
@@ -346,6 +377,7 @@ class OfflineSequenceSampler:
         out_next_states = []
         out_contacts = []
         out_terms = []
+        out_base_lin_vel_confidence = []
         for start, env_id in chosen.tolist():
             start = min(int(start), max_start)
             sl = slice(start, start + seq_len)
@@ -354,13 +386,19 @@ class OfflineSequenceSampler:
             out_next_states.append(self.next_states[sl, env_id])
             out_contacts.append(self.contacts[sl, env_id])
             out_terms.append(self.terminations[sl, env_id])
-        return (
+            out_base_lin_vel_confidence.append(
+                self.next_base_lin_vel_confidence[sl, env_id]
+            )
+        batch = (
             torch.stack(out_states, dim=0).to(device),
             torch.stack(out_actions, dim=0).to(device),
             torch.stack(out_next_states, dim=0).to(device),
             torch.stack(out_contacts, dim=0).to(device),
             torch.stack(out_terms, dim=0).to(device),
         )
+        if include_base_lin_vel_confidence:
+            return (*batch, torch.stack(out_base_lin_vel_confidence, dim=0).to(device))
+        return batch
 
     def metadata(self) -> dict[str, Any]:
         return {
@@ -371,6 +409,7 @@ class OfflineSequenceSampler:
             "action_dim": self.action_dim,
             "contact_dim": self.contact_dim,
             "termination_dim": self.termination_dim,
+            "has_base_lin_vel_confidence": self.has_base_lin_vel_confidence,
             "train_sequences": int(self.train_indices.shape[0]),
             "val_sequences": int(self.val_indices.shape[0]),
             "source_metadata": self.dataset.get("metadata") or {},

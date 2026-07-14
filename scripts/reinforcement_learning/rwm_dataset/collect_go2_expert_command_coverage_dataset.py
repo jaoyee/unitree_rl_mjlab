@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import random
 import sys
@@ -228,6 +229,15 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--trace_rollout_length", type=int, default=20)
     parser.add_argument("--trace_trajectories_per_state", type=int, default=4)
+    parser.add_argument(
+        "--trace_action_temperature",
+        type=float,
+        default=1.0,
+        help=(
+            "Policy sampling temperature used only for imperfect-simulator TRACE candidate rollouts. "
+            "Ordinary dataset collection remains deterministic."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -550,7 +560,12 @@ def _maybe_load_agent(
     )
 
 
-def _policy_actions(policy: LoadedPolicy | None, observations_by_kind: dict[str, np.ndarray]) -> torch.Tensor | None:
+def _policy_actions(
+    policy: LoadedPolicy | None,
+    observations_by_kind: dict[str, np.ndarray],
+    *,
+    action_temperature: float | None = None,
+) -> torch.Tensor | None:
     if policy is None:
         return None
     observations = observations_by_kind[policy.observation_kind]
@@ -558,6 +573,7 @@ def _policy_actions(policy: LoadedPolicy | None, observations_by_kind: dict[str,
         interaction_step=0,
         prev_transition={"next_observation": observations},
         training=False,
+        action_temperature=action_temperature,
     ).astype(np.float32)
     return torch.from_numpy(actions_np)
 
@@ -573,13 +589,22 @@ def _mixed_actions(
     action_noise_std: float,
     medium_action_noise_std: float,
     failure_action_noise_std: float,
+    action_temperature: float | None = None,
 ) -> torch.Tensor:
     actions = torch.empty(int(collector_ids.numel()), action_dim, device=device).uniform_(-1.0, 1.0)
 
-    expert_t = _policy_actions(expert_agent, observations_by_kind)
+    expert_t = _policy_actions(
+        expert_agent,
+        observations_by_kind,
+        action_temperature=action_temperature,
+    )
     if expert_t is not None:
         expert_t = expert_t.to(device=device, dtype=torch.float32)
-    medium_t = _policy_actions(medium_agent, observations_by_kind)
+    medium_t = _policy_actions(
+        medium_agent,
+        observations_by_kind,
+        action_temperature=action_temperature,
+    )
     if medium_t is not None:
         medium_t = medium_t.to(device=device, dtype=torch.float32)
     if medium_t is None:
@@ -790,6 +815,13 @@ def main() -> None:
     configure_low_thread_env()
     os.environ.setdefault("MUJOCO_GL", "egl")
     args = _parse_args()
+    if args.trace_reset_dataset and (
+        not math.isfinite(float(args.trace_action_temperature)) or float(args.trace_action_temperature) <= 0.0
+    ):
+        raise ValueError(
+            "TRACE imperfect-simulator action temperature must be finite and greater than zero, "
+            f"got {args.trace_action_temperature}."
+        )
     device = select_device(args.device)
     set_seed(int(args.seed))
     random.seed(int(args.seed))
@@ -971,6 +1003,9 @@ def main() -> None:
             "reset_dataset": None if args.trace_reset_dataset is None else str(args.trace_reset_dataset),
             "rollout_length": int(args.trace_rollout_length),
             "trajectories_per_state": int(args.trace_trajectories_per_state),
+            "action_temperature": (
+                float(args.trace_action_temperature) if trace_source_states is not None else None
+            ),
             "reset_is_exact": False,
             "unrecoverable_fields": ["root_position", "root_yaw", "actuator_force"],
         },
@@ -1150,6 +1185,9 @@ def main() -> None:
             action_noise_std=float(args.action_noise_std),
             medium_action_noise_std=float(args.medium_action_noise_std),
             failure_action_noise_std=float(args.failure_action_noise_std),
+            action_temperature=(
+                float(args.trace_action_temperature) if trace_source_states is not None else None
+            ),
         )
         env_action_t, env_action_delay_steps = _apply_env_step_action_interface(
             action_t,

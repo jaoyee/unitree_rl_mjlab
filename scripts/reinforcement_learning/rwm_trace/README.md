@@ -31,6 +31,7 @@ uv run python scripts/reinforcement_learning/rwm_dataset/collect_go2_expert_comm
   --collector_mix expert:1.0 \
   --trace_reset_dataset <OFFLINE_DATASET.pt> \
   --trace_rollout_length 20 --trace_trajectories_per_state 4 \
+  --trace_action_temperature 1.0 \
   --num_envs 4096 --num_transitions 1000000 \
   --randomization_preset <MISMATCH_PRESET> \
   --save_path logs/trace/imperfect_sim_candidates.pt
@@ -38,6 +39,10 @@ uv run python scripts/reinforcement_learning/rwm_dataset/collect_go2_expert_comm
 
 Here `4096 = 1024 starting states x 4 trajectories per state`. Lower
 `num_envs` proportionally reduces the number of distinct starting states.
+`trace_action_temperature` scales the expert policy's sampling noise only in
+these imperfect-simulator candidate rollouts. Ordinary dataset collection and
+evaluation remain deterministic. Record and tune this value independently of
+the SAC entropy coefficient and environment action-interface noise.
 
 Create summaries before the first scorer exists:
 

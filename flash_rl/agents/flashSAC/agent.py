@@ -439,11 +439,11 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
         interaction_step: int,
         prev_transition: MutableMapping[str, Tensor],
         training: bool,
+        action_temperature: float | None = None,
     ) -> Tensor:
-        if training:
-            temperature = 1.0
-        else:
-            temperature = 0.0
+        temperature = float(action_temperature) if action_temperature is not None else (1.0 if training else 0.0)
+        if not math.isfinite(temperature) or temperature < 0.0:
+            raise ValueError(f"Action temperature must be finite and non-negative, got {temperature}.")
 
         observations = prev_transition["next_observation"]
         if self._cfg.asymmetric_observation:

@@ -17,3 +17,27 @@ src/assets/motions/g1/dance1_subject2.npz
 simulate/build
 __pycache__
 archived_uncommitted_rwm_experiments/
+
+# Python and test caches
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Generated experiment artifacts
+**/dataset*.pt
+**/model_*.pt
+**/latest.pt
+**/actor.pt
+**/critic.pt
+**/checkpoints/
+**/step*/
+exports/
+*.onnx
+*.log
+*.pid
+
+# Native build outputs
+build/
+build_*/
+dist/

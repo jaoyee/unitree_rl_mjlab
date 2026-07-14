@@ -28,6 +28,7 @@ dependencies = [
     "prettytable",
     "scipy",
     "onnx>=1.16",
+    "onnxruntime==1.23.2",
     "onnxscript>=0.1.0",
 ]
 

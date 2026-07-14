@@ -1,0 +1,135 @@
+{
+  "broken_joint_names": [],
+  "budgets": {
+    "dataset_num_envs": 1024,
+    "dataset_shard_transitions": [
+      249856,
+      249856,
+      249856,
+      250880
+    ],
+    "expert_num_env_steps": 100000000,
+    "expert_num_envs": 1024,
+    "policy_num_env_steps": 50000000,
+    "policy_num_imagination_envs": 1024,
+    "rwm_max_iterations": 5000
+  },
+  "common_baseline": {
+    "base_height_target": 0.32,
+    "command_ranges": {
+      "expert_and_collection_ang_vel_z": [
+        -0.6,
+        0.6
+      ],
+      "expert_and_collection_lin_vel_x": [
+        -0.8,
+        0.8
+      ],
+      "expert_and_collection_lin_vel_y": [
+        -0.3,
+        0.3
+      ],
+      "imagination_ang_vel_z": [
+        -0.5,
+        0.5
+      ],
+      "imagination_lin_vel_x": [
+        -0.5,
+        0.5
+      ],
+      "imagination_lin_vel_y": [
+        -0.25,
+        0.25
+      ]
+    },
+    "damping_per_leg": [
+      1.5,
+      2.0,
+      2.5
+    ],
+    "default_joint_pos_per_leg": [
+      0.0,
+      0.8,
+      -1.5
+    ],
+    "friction_center": 0.8,
+    "friction_full_range": [
+      0.6,
+      1.0
+    ],
+    "stiffness_per_leg": [
+      30.0,
+      40.0,
+      50.0
+    ]
+  },
+  "factors": {
+    "D": {
+      "D0": [
+        "calibrated_default",
+        1.0
+      ],
+      "D1": [
+        "calibrated_friend_flat",
+        0.5
+      ],
+      "D2": [
+        "calibrated_friend_flat",
+        1.0
+      ]
+    },
+    "E": {
+      "E0": [
+        "calibrated_default",
+        1.0
+      ],
+      "E1": [
+        "calibrated_friend_flat",
+        0.5
+      ],
+      "E2": [
+        "calibrated_friend_flat",
+        1.0
+      ]
+    },
+    "P": {
+      "P0": [
+        0.0,
+        "none",
+        0.0
+      ],
+      "P1": [
+        0.01,
+        "none",
+        0.0
+      ],
+      "P2": [
+        0.0,
+        "deployment_small",
+        0.25
+      ],
+      "P3": [
+        0.01,
+        "deployment_small",
+        0.25
+      ]
+    }
+  },
+  "gpu_pool": [
+    "1",
+    "2",
+    "3",
+    "4",
+    "5",
+    "7"
+  ],
+  "include_evaluations": true,
+  "job_count": 93,
+  "joint_strength_scales": {},
+  "mask_indices": [],
+  "matrix_selection": "all",
+  "normal_go2": true,
+  "run_id": "normal_go2_fixstand_v2_moderate_seed0_20260712",
+  "status": "queued",
+  "task": "Unitree-Go2-Flat-Normal-FixStand-Proprioceptive-Expert"
+}

@@ -1,0 +1,238 @@
+{
+  "output": "D:\\whaleCpanDir\\Desktop\\RL\\unitree_rl_mjlab_model_based_broken\\analysis_results\\real_dataset_smoke\\dataset.pt",
+  "format_version": "go2_mixed_rwm_dataset_v2",
+  "conversion_kind": "approximate_legacy",
+  "rejected_input_rows": 2,
+  "transitions": 1812,
+  "sampler": {
+    "num_transitions": 1812,
+    "num_time_steps": 1812,
+    "num_envs": 1,
+    "state_dim": 45,
+    "action_dim": 12,
+    "contact_dim": 4,
+    "termination_dim": 1,
+    "train_sequences": 1684,
+    "val_sequences": 89,
+    "source_metadata": {
+      "source": "real_go2_csv",
+      "conversion_kind": "approximate_legacy",
+      "source_csvs": [
+        "D:\\whaleCpanDir\\Desktop\\RL\\run_data_2026-07-13_16-22-10.csv"
+      ],
+      "num_input_rows": 1813,
+      "num_time_steps": 1812,
+      "num_transitions": 1812,
+      "num_episodes": 1,
+      "state_layout": [
+        "base_lin_vel_b[3]",
+        "base_ang_vel_b[3]",
+        "projected_gravity_b[3]",
+        "joint_pos_rel[12]",
+        "joint_vel[12]",
+        "actuator_force[12]"
+      ],
+      "state_loss_ignored_indices": [
+        0,
+        1,
+        2
+      ],
+      "base_lin_vel_source": "zero_placeholder_unsupervised",
+      "policy_observation_kind": "proprioceptive_45d",
+      "policy_observation_layout": [
+        "base_ang_vel_b[3]",
+        "projected_gravity_b[3]",
+        "command[3]",
+        "joint_pos_rel[12]",
+        "joint_vel[12]",
+        "last_action[12]"
+      ],
+      "joint_ids_map": [
+        3,
+        4,
+        5,
+        0,
+        1,
+        2,
+        9,
+        10,
+        11,
+        6,
+        7,
+        8
+      ],
+      "joint_names": [
+        "FL_hip_joint",
+        "FL_thigh_joint",
+        "FL_calf_joint",
+        "FR_hip_joint",
+        "FR_thigh_joint",
+        "FR_calf_joint",
+        "RL_hip_joint",
+        "RL_thigh_joint",
+        "RL_calf_joint",
+        "RR_hip_joint",
+        "RR_thigh_joint",
+        "RR_calf_joint"
+      ],
+      "sdk_joint_names": [
+        "FR_hip_joint",
+        "FR_thigh_joint",
+        "FR_calf_joint",
+        "FL_hip_joint",
+        "FL_thigh_joint",
+        "FL_calf_joint",
+        "RR_hip_joint",
+        "RR_thigh_joint",
+        "RR_calf_joint",
+        "RL_hip_joint",
+        "RL_thigh_joint",
+        "RL_calf_joint"
+      ],
+      "contact_names": [
+        "FR",
+        "FL",
+        "RR",
+        "RL"
+      ],
+      "step_dt": 0.02,
+      "measured_dt_mean": 0.020555739514348786,
+      "measured_dt_min": 0.01999999999999602,
+      "measured_dt_max": 0.02120000000000033,
+      "action_sources": [
+        "q_des_inverse"
+      ],
+      "max_next_obs_action_alignment_error": null,
+      "reward_available": false,
+      "collector_counts": {
+        "expert": 1812
+      },
+      "rejected_input_rows": 2,
+      "deploy_yaml": "D:\\whaleCpanDir\\Desktop\\RL\\unitree_rl_mjlab_model_based_broken\\deploy\\robots\\go2\\config\\policy\\velocity\\rwm_proprioceptive_normal\\params\\deploy.yaml"
+    }
+  },
+  "sample_shapes": [
+    [
+      2,
+      40,
+      45
+    ],
+    [
+      2,
+      40,
+      12
+    ],
+    [
+      2,
+      40,
+      45
+    ],
+    [
+      2,
+      40,
+      4
+    ],
+    [
+      2,
+      40,
+      1
+    ]
+  ],
+  "action_abs_max": 0.9783999919891357,
+  "metadata": {
+    "source": "real_go2_csv",
+    "conversion_kind": "approximate_legacy",
+    "source_csvs": [
+      "D:\\whaleCpanDir\\Desktop\\RL\\run_data_2026-07-13_16-22-10.csv"
+    ],
+    "num_input_rows": 1813,
+    "num_time_steps": 1812,
+    "num_transitions": 1812,
+    "num_episodes": 1,
+    "state_layout": [
+      "base_lin_vel_b[3]",
+      "base_ang_vel_b[3]",
+      "projected_gravity_b[3]",
+      "joint_pos_rel[12]",
+      "joint_vel[12]",
+      "actuator_force[12]"
+    ],
+    "state_loss_ignored_indices": [
+      0,
+      1,
+      2
+    ],
+    "base_lin_vel_source": "zero_placeholder_unsupervised",
+    "policy_observation_kind": "proprioceptive_45d",
+    "policy_observation_layout": [
+      "base_ang_vel_b[3]",
+      "projected_gravity_b[3]",
+      "command[3]",
+      "joint_pos_rel[12]",
+      "joint_vel[12]",
+      "last_action[12]"
+    ],
+    "joint_ids_map": [
+      3,
+      4,
+      5,
+      0,
+      1,
+      2,
+      9,
+      10,
+      11,
+      6,
+      7,
+      8
+    ],
+    "joint_names": [
+      "FL_hip_joint",
+      "FL_thigh_joint",
+      "FL_calf_joint",
+      "FR_hip_joint",
+      "FR_thigh_joint",
+      "FR_calf_joint",
+      "RL_hip_joint",
+      "RL_thigh_joint",
+      "RL_calf_joint",
+      "RR_hip_joint",
+      "RR_thigh_joint",
+      "RR_calf_joint"
+    ],
+    "sdk_joint_names": [
+      "FR_hip_joint",
+      "FR_thigh_joint",
+      "FR_calf_joint",
+      "FL_hip_joint",
+      "FL_thigh_joint",
+      "FL_calf_joint",
+      "RR_hip_joint",
+      "RR_thigh_joint",
+      "RR_calf_joint",
+      "RL_hip_joint",
+      "RL_thigh_joint",
+      "RL_calf_joint"
+    ],
+    "contact_names": [
+      "FR",
+      "FL",
+      "RR",
+      "RL"
+    ],
+    "step_dt": 0.02,
+    "measured_dt_mean": 0.020555739514348786,
+    "measured_dt_min": 0.01999999999999602,
+    "measured_dt_max": 0.02120000000000033,
+    "action_sources": [
+      "q_des_inverse"
+    ],
+    "max_next_obs_action_alignment_error": null,
+    "reward_available": false,
+    "collector_counts": {
+      "expert": 1812
+    },
+    "rejected_input_rows": 2,
+    "deploy_yaml": "D:\\whaleCpanDir\\Desktop\\RL\\unitree_rl_mjlab_model_based_broken\\deploy\\robots\\go2\\config\\policy\\velocity\\rwm_proprioceptive_normal\\params\\deploy.yaml"
+  }
+}

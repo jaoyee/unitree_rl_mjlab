@@ -9,6 +9,12 @@ export WANDB_MODE="${WANDB_MODE:-offline}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/uv-cache}"
 
+PYTHON_BIN="${PYTHON_BIN:-${REPO_ROOT}/.venv/bin/python}"
+if [[ ! -x "${PYTHON_BIN}" ]]; then
+  echo "Python environment not found: ${PYTHON_BIN}" >&2
+  exit 1
+fi
+
 DATASET_PATH="${DATASET_PATH:-logs/rwm_datasets/go2_rr_calf_strength_0p5_proprioceptive_mixed_1m/dataset.pt}"
 WM_CONFIG_PATH="${WM_CONFIG_PATH:-scripts/reinforcement_learning/rwm_dataset/configs/go2_offline_world_model_proprioceptive.yaml}"
 WM_SAVE_BASE="${WM_SAVE_BASE:-logs/rsl_rl/go2_rr_calf_strength_0p5_proprioceptive_unmasked}"
@@ -24,7 +30,7 @@ if [[ ! -f "${DATASET_PATH}" ]]; then
   exit 1
 fi
 
-uv run python scripts/reinforcement_learning/rwm_dataset/train_world_model_offline_go2_proprioceptive.py \
+"${PYTHON_BIN}" scripts/reinforcement_learning/rwm_dataset/train_world_model_offline_go2_proprioceptive.py \
   --config_path "${WM_CONFIG_PATH}" \
   --dataset_path "${DATASET_PATH}" \
   --save_dir "${WM_SAVE_BASE}" \

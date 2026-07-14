@@ -9,6 +9,12 @@ export WANDB_MODE="${WANDB_MODE:-offline}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/uv-cache}"
 
+PYTHON_BIN="${PYTHON_BIN:-${REPO_ROOT}/.venv/bin/python}"
+if [[ ! -x "${PYTHON_BIN}" ]]; then
+  echo "Python environment not found: ${PYTHON_BIN}" >&2
+  exit 1
+fi
+
 DATASET_PATH="${DATASET_PATH:-logs/rwm_datasets/go2_rr_calf_strength_0p5_proprioceptive_mixed_1m/dataset.pt}"
 POLICY_CONFIG_PATH="${POLICY_CONFIG_PATH:-scripts/reinforcement_learning/rwm_flashsac/configs/go2_flashsac_rwm_proprioceptive.yaml}"
 WM_SAVE_BASE="${WM_SAVE_BASE:-logs/rsl_rl/go2_rr_calf_strength_0p5_proprioceptive_unmasked}"
@@ -19,6 +25,18 @@ SAC_SAVE_PATH="${SAC_SAVE_PATH:-logs/model_based/go2_rr_calf_strength_0p5_propri
 SAC_NUM_IMAGINATION_ENVS="${SAC_NUM_IMAGINATION_ENVS:-1024}"
 SAC_NUM_ENV_STEPS="${SAC_NUM_ENV_STEPS:-50000000}"
 SAC_DEVICE="${SAC_DEVICE:-cuda:0}"
+RWM_INTERFACE_ACTION_NOISE_STD="${RWM_INTERFACE_ACTION_NOISE_STD:-0.0}"
+RWM_INTERFACE_ACTION_BIAS_STD="${RWM_INTERFACE_ACTION_BIAS_STD:-0.0}"
+RWM_INTERFACE_ACTION_SCALE_MIN="${RWM_INTERFACE_ACTION_SCALE_MIN:-1.0}"
+RWM_INTERFACE_ACTION_SCALE_MAX="${RWM_INTERFACE_ACTION_SCALE_MAX:-1.0}"
+RWM_INTERFACE_ACTION_DELAY_STEPS_MIN="${RWM_INTERFACE_ACTION_DELAY_STEPS_MIN:-0}"
+RWM_INTERFACE_ACTION_DELAY_STEPS_MAX="${RWM_INTERFACE_ACTION_DELAY_STEPS_MAX:-0}"
+RWM_INTERFACE_OBS_NOISE_PROFILE="${RWM_INTERFACE_OBS_NOISE_PROFILE:-none}"
+RWM_INTERFACE_OBS_NOISE_SCALE="${RWM_INTERFACE_OBS_NOISE_SCALE:-1.0}"
+RWM_INTERFACE_OBS_JOINT_POS_BIAS_MIN="${RWM_INTERFACE_OBS_JOINT_POS_BIAS_MIN:-0.0}"
+RWM_INTERFACE_OBS_JOINT_POS_BIAS_MAX="${RWM_INTERFACE_OBS_JOINT_POS_BIAS_MAX:-0.0}"
+RWM_INTERFACE_OBS_NOISE_STD="${RWM_INTERFACE_OBS_NOISE_STD:-0.0}"
+RWM_INTERFACE_OBS_BIAS_STD="${RWM_INTERFACE_OBS_BIAS_STD:-0.0}"
 
 if [[ ! -f "${DATASET_PATH}" ]]; then
   echo "Dataset not found: ${DATASET_PATH}" >&2
@@ -46,7 +64,7 @@ if [[ ! -f "${WM_MODEL_PATH}" ]]; then
   exit 1
 fi
 
-uv run python scripts/reinforcement_learning/rwm_flashsac/train_flashsac_world_model_go2_proprioceptive.py \
+"${PYTHON_BIN}" scripts/reinforcement_learning/rwm_flashsac/train_flashsac_world_model_go2_proprioceptive.py \
   --config_path "${POLICY_CONFIG_PATH}" \
   --model_resume_path "${WM_MODEL_PATH}" \
   --dataset_path "${DATASET_PATH}" \
@@ -57,4 +75,16 @@ uv run python scripts/reinforcement_learning/rwm_flashsac/train_flashsac_world_m
   --overrides "world_model.policy_action_mask_indices=[]" \
   --overrides "world_model.world_model_action_mask_indices=[]" \
   --overrides "world_model.policy_observation_mask_indices=[]" \
-  --overrides "world_model.broken_joint_names=[]"
+  --overrides "world_model.broken_joint_names=[]" \
+  --overrides "world_model.interface_action_noise_std=${RWM_INTERFACE_ACTION_NOISE_STD}" \
+  --overrides "world_model.interface_action_bias_std=${RWM_INTERFACE_ACTION_BIAS_STD}" \
+  --overrides "world_model.interface_action_scale_min=${RWM_INTERFACE_ACTION_SCALE_MIN}" \
+  --overrides "world_model.interface_action_scale_max=${RWM_INTERFACE_ACTION_SCALE_MAX}" \
+  --overrides "world_model.interface_action_delay_steps_min=${RWM_INTERFACE_ACTION_DELAY_STEPS_MIN}" \
+  --overrides "world_model.interface_action_delay_steps_max=${RWM_INTERFACE_ACTION_DELAY_STEPS_MAX}" \
+  --overrides "world_model.interface_obs_noise_profile=${RWM_INTERFACE_OBS_NOISE_PROFILE}" \
+  --overrides "world_model.interface_obs_noise_scale=${RWM_INTERFACE_OBS_NOISE_SCALE}" \
+  --overrides "world_model.interface_obs_joint_pos_bias_min=${RWM_INTERFACE_OBS_JOINT_POS_BIAS_MIN}" \
+  --overrides "world_model.interface_obs_joint_pos_bias_max=${RWM_INTERFACE_OBS_JOINT_POS_BIAS_MAX}" \
+  --overrides "world_model.interface_obs_noise_std=${RWM_INTERFACE_OBS_NOISE_STD}" \
+  --overrides "world_model.interface_obs_bias_std=${RWM_INTERFACE_OBS_BIAS_STD}"

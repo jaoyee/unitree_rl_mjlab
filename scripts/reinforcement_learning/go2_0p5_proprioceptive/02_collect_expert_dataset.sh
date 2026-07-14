@@ -9,6 +9,12 @@ export WANDB_MODE="${WANDB_MODE:-offline}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/uv-cache}"
 
+PYTHON_BIN="${PYTHON_BIN:-${REPO_ROOT}/.venv/bin/python}"
+if [[ ! -x "${PYTHON_BIN}" ]]; then
+  echo "Python environment not found: ${PYTHON_BIN}" >&2
+  exit 1
+fi
+
 : "${EXPERT_POLICY_PATH:?Set EXPERT_POLICY_PATH to the 0.5-strength proprioceptive expert checkpoint directory.}"
 
 DATASET_PATH="${DATASET_PATH:-logs/rwm_datasets/go2_rr_calf_strength_0p5_proprioceptive_mixed_1m/dataset.pt}"
@@ -42,6 +48,15 @@ COMMAND_RESAMPLE_INTERVAL_MAX="${COMMAND_RESAMPLE_INTERVAL_MAX:-300}"
 USE_DOMAIN_RANDOMIZATION="${USE_DOMAIN_RANDOMIZATION:-false}"
 USE_PUSH_RANDOMIZATION="${USE_PUSH_RANDOMIZATION:-false}"
 USE_OBSERVATION_NOISE="${USE_OBSERVATION_NOISE:-false}"
+RANDOMIZATION_PRESET="${RANDOMIZATION_PRESET:-default}"
+RANDOMIZATION_COMPONENTS="${RANDOMIZATION_COMPONENTS:-}"
+RANDOMIZATION_SCALE="${RANDOMIZATION_SCALE:-1.0}"
+ENV_ACTION_NOISE_STD="${ENV_ACTION_NOISE_STD:-0.0}"
+ENV_ACTION_BIAS_STD="${ENV_ACTION_BIAS_STD:-0.0}"
+ENV_ACTION_SCALE_MIN="${ENV_ACTION_SCALE_MIN:-1.0}"
+ENV_ACTION_SCALE_MAX="${ENV_ACTION_SCALE_MAX:-1.0}"
+ENV_ACTION_DELAY_STEPS_MIN="${ENV_ACTION_DELAY_STEPS_MIN:-0}"
+ENV_ACTION_DELAY_STEPS_MAX="${ENV_ACTION_DELAY_STEPS_MAX:-0}"
 RESET_PARTS="${RESET_PARTS:-true}"
 
 BROKEN_JOINT_ARGS=()
@@ -78,7 +93,7 @@ if [[ "${RESET_PARTS}" == "true" ]]; then
   rm -rf "$(dirname "${DATASET_PATH}")/parts"
 fi
 
-uv run python scripts/reinforcement_learning/rwm_dataset/collect_go2_expert_command_coverage_dataset.py \
+"${PYTHON_BIN}" scripts/reinforcement_learning/rwm_dataset/collect_go2_expert_command_coverage_dataset.py \
   --task "${COLLECT_TASK}" \
   --device "${COLLECT_DEVICE}" \
   --num_envs "${COLLECT_NUM_ENVS}" \
@@ -91,6 +106,13 @@ uv run python scripts/reinforcement_learning/rwm_dataset/collect_go2_expert_comm
   --action_noise_std "${ACTION_NOISE_STD}" \
   --medium_action_noise_std "${MEDIUM_ACTION_NOISE_STD}" \
   --failure_action_noise_std "${FAILURE_ACTION_NOISE_STD}" \
+  --randomization_preset "${RANDOMIZATION_PRESET}" \
+  --randomization_components "${RANDOMIZATION_COMPONENTS}" \
+  --randomization_scale "${RANDOMIZATION_SCALE}" \
+  --env_action_noise_std "${ENV_ACTION_NOISE_STD}" \
+  --env_action_bias_std "${ENV_ACTION_BIAS_STD}" \
+  --env_action_scale_range "${ENV_ACTION_SCALE_MIN}" "${ENV_ACTION_SCALE_MAX}" \
+  --env_action_delay_steps "${ENV_ACTION_DELAY_STEPS_MIN}" "${ENV_ACTION_DELAY_STEPS_MAX}" \
   --chunk_size "${COLLECT_CHUNK_SIZE}" \
   --command_modes "${COMMAND_MODES}" \
   --command_mode_weights "${COMMAND_MODE_WEIGHTS}" \

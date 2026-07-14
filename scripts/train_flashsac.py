@@ -354,6 +354,13 @@ def _create_mjlab_envs_like_ppo(
         use_domain_randomization=cfg.env.get("use_domain_randomization", True),
         use_push_randomization=cfg.env.get("use_push_randomization", True),
         use_observation_noise=cfg.env.get("use_observation_noise", True),
+        randomization_preset=cfg.env.get("randomization_preset", "default"),
+        randomization_components=cfg.env.get("randomization_components", None),
+        randomization_scale=cfg.env.get("randomization_scale", 1.0),
+        payload_mass_range_kg=cfg.env.get("payload_mass_range_kg", None),
+        payload_position_body_m=cfg.env.get("payload_position_body_m", None),
+        payload_box_size_m=cfg.env.get("payload_box_size_m", None),
+        rr_calf_strength_range=cfg.env.get("rr_calf_strength_range", None),
     )
 
     print(

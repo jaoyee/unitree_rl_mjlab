@@ -119,6 +119,21 @@ def body_orientation_l2(
   return xy_squared
 
 
+def base_height_l2(
+  env: ManagerBasedRlEnv,
+  target_height: float,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Penalize squared root-height error from a deployment-aligned target."""
+  asset: Entity = env.scene[asset_cfg.name]
+  error = asset.data.root_link_pos_w[:, 2] - float(target_height)
+  cost = torch.square(error)
+  log = env.extras.setdefault("log", {})
+  log["Metrics/base_height_mean"] = torch.mean(asset.data.root_link_pos_w[:, 2])
+  log["Metrics/base_height_abs_error_mean"] = torch.mean(torch.abs(error))
+  return cost
+
+
 def self_collision_cost(
   env: ManagerBasedRlEnv,
   sensor_name: str,

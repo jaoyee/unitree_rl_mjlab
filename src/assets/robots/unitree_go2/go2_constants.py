@@ -67,6 +67,31 @@ GO2_ACTUATOR_CALF = BuiltinPositionActuatorCfg(
   armature=0.02,
 )
 
+# Dedicated controller used by the normal sim-to-real baseline. These gains
+# sit between the old soft locomotion controller and the much stiffer
+# robot-side FixStand controller; deployment blends between them on entry.
+GO2_FIXSTAND_ACTUATOR_HIP = BuiltinPositionActuatorCfg(
+  target_names_expr=(".*hip_.*",),
+  stiffness=30.0,
+  damping=1.5,
+  effort_limit=23.5,
+  armature=0.01,
+)
+GO2_FIXSTAND_ACTUATOR_THIGH = BuiltinPositionActuatorCfg(
+  target_names_expr=(".*thigh_.*",),
+  stiffness=40.0,
+  damping=2.0,
+  effort_limit=23.5,
+  armature=0.01,
+)
+GO2_FIXSTAND_ACTUATOR_CALF = BuiltinPositionActuatorCfg(
+  target_names_expr=(".*calf_.*",),
+  stiffness=50.0,
+  damping=2.5,
+  effort_limit=45.0,
+  armature=0.02,
+)
+
 _GO2_ACTUATOR_GROUPS = (
   (
     ("FL_hip_joint", "FR_hip_joint", "RL_hip_joint", "RR_hip_joint"),
@@ -175,6 +200,16 @@ INIT_STATE = EntityCfg.InitialStateCfg(
   joint_vel={".*": 0.0},
 )
 
+FIXSTAND_INIT_STATE = EntityCfg.InitialStateCfg(
+  pos=(0.0, 0.0, 0.36),
+  joint_pos={
+    ".*hip_joint": 0.0,
+    ".*thigh_joint": 0.8,
+    ".*calf_joint": -1.5,
+  },
+  joint_vel={".*": 0.0},
+)
+
 ##
 # Collision config.
 ##
@@ -205,6 +240,16 @@ FULL_COLLISION = CollisionCfg(
   conaffinity=0,
 )
 
+FIXSTAND_FULL_COLLISION = CollisionCfg(
+  geom_names_expr=(".*_collision",),
+  condim={_foot_regex: 3, ".*_collision": 1},
+  priority={_foot_regex: 1},
+  friction={_foot_regex: (0.8,)},
+  solimp={_foot_regex: (0.9, 0.95, 0.023)},
+  contype=1,
+  conaffinity=0,
+)
+
 ##
 # Final config.
 ##
@@ -214,6 +259,15 @@ GO2_ARTICULATION = EntityArticulationInfoCfg(
     GO2_ACTUATOR_HIP,
     GO2_ACTUATOR_THIGH,
     GO2_ACTUATOR_CALF,
+  ),
+  soft_joint_pos_limit_factor=0.9,
+)
+
+GO2_FIXSTAND_ARTICULATION = EntityArticulationInfoCfg(
+  actuators=(
+    GO2_FIXSTAND_ACTUATOR_HIP,
+    GO2_FIXSTAND_ACTUATOR_THIGH,
+    GO2_FIXSTAND_ACTUATOR_CALF,
   ),
   soft_joint_pos_limit_factor=0.9,
 )
@@ -236,6 +290,17 @@ def get_go2_robot_cfg(
       broken_pd_joint_names=broken_pd_joint_names,
       joint_strength_scales=joint_strength_scales,
     ),
+  )
+
+
+def get_go2_fixstand_robot_cfg() -> EntityCfg:
+  """Return the healthy Go2 with FixStand-aligned pose and controller gains."""
+
+  return EntityCfg(
+    init_state=FIXSTAND_INIT_STATE,
+    collisions=(FIXSTAND_FULL_COLLISION,),
+    spec_fn=get_spec,
+    articulation=GO2_FIXSTAND_ARTICULATION,
   )
 
 if __name__ == "__main__":

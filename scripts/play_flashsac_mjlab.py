@@ -185,9 +185,14 @@ def play(args: argparse.Namespace) -> None:
 
         NativeMujocoViewer(viewer_env, policy).run()
     elif viewer_type == "viser":
+        import viser
         from mjlab.viewer import ViserPlayViewer
 
-        ViserPlayViewer(viewer_env, policy).run()
+        viser_port = os.environ.get("VISER_PORT")
+        viser_server = None
+        if viser_port:
+            viser_server = viser.ViserServer(port=int(viser_port), label="mjlab")
+        ViserPlayViewer(viewer_env, policy, viser_server=viser_server).run()
     else:
         raise ValueError(f"Unknown viewer: {viewer_type!r}")
 

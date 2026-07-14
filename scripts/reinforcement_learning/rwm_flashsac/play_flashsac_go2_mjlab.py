@@ -301,7 +301,20 @@ def main() -> None:
     if resolved_viewer == "native":
         NativeMujocoViewer(wrapped_env, policy, frame_rate=args.frame_rate).run()
     else:
-        ViserPlayViewer(wrapped_env, policy, frame_rate=args.frame_rate).run()
+        import os
+
+        import viser
+
+        viser_port = os.environ.get("VISER_PORT")
+        viser_server = None
+        if viser_port:
+            viser_server = viser.ViserServer(port=int(viser_port), label="mjlab")
+        ViserPlayViewer(
+            wrapped_env,
+            policy,
+            frame_rate=args.frame_rate,
+            viser_server=viser_server,
+        ).run()
     wrapped_env.close()
 
 

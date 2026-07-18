@@ -19,9 +19,10 @@ def load_any_go2_dynamics_checkpoint(
 ) -> tuple[Any, dict[str, Any]]:
     """Load either the original full-state RWM or the proprioceptive RWM.
 
-    The proprioceptive model consumes ``state[..., 3:45]`` internally, but still
-    returns the original full 45-dim next-state prediction. That keeps the
-    existing FlashSAC imagination env and 48-dim policy observation compatible.
+    The proprioceptive model consumes the state features recorded in its
+    checkpoint configuration (all 45 by default) and returns the full 45-dim
+    next-state prediction. This keeps the existing FlashSAC imagination env and
+    48-dim policy observation compatible.
     """
 
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)

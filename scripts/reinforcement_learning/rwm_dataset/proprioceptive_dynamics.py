@@ -1,7 +1,7 @@
 """Proprioceptive Go2 dynamics for real-world sensor ablations.
 
-The default model consumes ``full_state[..., 3:45]`` and predicts the full
-45-dim next state. Masked-joint experiments can additionally remove joint
+The default model consumes the full 45-dim state and predicts the full 45-dim
+next state. Explicit ablations can remove selected state or joint
 state/action features from the network input and output while keeping the
 external mjlab/RWM state-action interface full-sized.
 """
@@ -25,7 +25,7 @@ from scripts.reinforcement_learning.rwm_dataset.joint_feature_mask import (
 
 @dataclass
 class ProprioceptiveDynamicsConfig:
-    input_state_dim: int = 42
+    input_state_dim: int = 45
     output_state_dim: int = 45
     action_dim: int = 12
     full_state_dim: int = 45
@@ -47,7 +47,7 @@ class ProprioceptiveDynamicsConfig:
     contact_loss_weight: float = 1.0
     termination_loss_weight: float = 1.0
     loss_mode: str = "reference_autoregressive_mse"
-    dropped_state_indices: tuple[int, ...] = (0, 1, 2)
+    dropped_state_indices: tuple[int, ...] = ()
     output_dropped_state_indices: tuple[int, ...] = ()
     state_loss_ignored_indices: tuple[int, ...] = ()
     dropped_action_indices: tuple[int, ...] = ()
@@ -516,7 +516,10 @@ class ProprioceptiveSystemDynamicsEnsemble(nn.Module):
                 **(infos or {}),
                 "model_type": "go2_proprioceptive",
                 "proprioceptive_dynamics_config": asdict(self.cfg),
-                "input_state_layout": "full_state[..., 3:45]",
+                "input_state_layout": (
+                    "full 45-dim Go2 RWM state; "
+                    f"dropped_state_indices={list(self.cfg.dropped_state_indices)}"
+                ),
                 "output_state_layout": "full 45-dim Go2 RWM state",
             },
         }

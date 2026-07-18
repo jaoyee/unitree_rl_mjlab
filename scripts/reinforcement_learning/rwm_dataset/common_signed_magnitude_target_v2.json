@@ -1,0 +1,150 @@
+{
+  "axis_order": [
+    "x",
+    "y",
+    "yaw"
+  ],
+  "bucket_order_per_axis": [
+    "neg_b0",
+    "neg_b1",
+    "neg_b2",
+    "pos_b0",
+    "pos_b1",
+    "pos_b2"
+  ],
+  "diagnostics": {
+    "x": {
+      "bucket_order": [
+        "neg_b0",
+        "neg_b1",
+        "neg_b2",
+        "pos_b0",
+        "pos_b1",
+        "pos_b2"
+      ],
+      "common_available_counts": {
+        "neg_b0": 588,
+        "neg_b1": 1012,
+        "neg_b2": 1247,
+        "pos_b0": 1922,
+        "pos_b1": 1909,
+        "pos_b2": 8557
+      },
+      "symmetric_capacity_weights": [
+        588.0,
+        1012.0,
+        1247.0,
+        588.0,
+        1012.0,
+        1247.0
+      ],
+      "symmetric_common_capacity_total": 5694.0,
+      "target_counts": [
+        1781,
+        3066,
+        3778,
+        1781,
+        3066,
+        3778
+      ],
+      "target_is_soft": true,
+      "target_total": 17250
+    },
+    "y": {
+      "bucket_order": [
+        "neg_b0",
+        "neg_b1",
+        "neg_b2",
+        "pos_b0",
+        "pos_b1",
+        "pos_b2"
+      ],
+      "common_available_counts": {
+        "neg_b0": 723,
+        "neg_b1": 1091,
+        "neg_b2": 5699,
+        "pos_b0": 1456,
+        "pos_b1": 1311,
+        "pos_b2": 4170
+      },
+      "symmetric_capacity_weights": [
+        723.0,
+        1091.0,
+        4170.0,
+        723.0,
+        1091.0,
+        4170.0
+      ],
+      "symmetric_common_capacity_total": 11968.0,
+      "target_counts": [
+        634,
+        957,
+        3659,
+        634,
+        957,
+        3659
+      ],
+      "target_is_soft": true,
+      "target_total": 10500
+    },
+    "yaw": {
+      "bucket_order": [
+        "neg_b0",
+        "neg_b1",
+        "neg_b2",
+        "pos_b0",
+        "pos_b1",
+        "pos_b2"
+      ],
+      "common_available_counts": {
+        "neg_b0": 573,
+        "neg_b1": 492,
+        "neg_b2": 6531,
+        "pos_b0": 943,
+        "pos_b1": 712,
+        "pos_b2": 6703
+      },
+      "symmetric_capacity_weights": [
+        573.0,
+        492.0,
+        6531.0,
+        573.0,
+        492.0,
+        6531.0
+      ],
+      "symmetric_common_capacity_total": 15192.0,
+      "target_counts": [
+        406,
+        348,
+        4621,
+        406,
+        348,
+        4621
+      ],
+      "target_is_soft": true,
+      "target_total": 10750
+    }
+  },
+  "marginal_target_counts": [
+    1781,
+    3066,
+    3778,
+    1781,
+    3066,
+    3778,
+    634,
+    957,
+    3659,
+    634,
+    957,
+    3659,
+    406,
+    348,
+    4621,
+    406,
+    348,
+    4621
+  ],
+  "schema": "go2_common_signed_magnitude_target_v2",
+  "source_audit": "/data1/xjy/unitree_rl_mjlab_normal_fixstand_v2/logs/rwm_datasets_v2/audits/real_v1_command_support.json"
+}

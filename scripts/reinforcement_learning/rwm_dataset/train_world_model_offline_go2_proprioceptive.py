@@ -1,7 +1,8 @@
-"""Train a Go2 offline RWM with a true 42-dim state input.
+"""Train a Go2 offline RWM with a configurable full-state input.
 
-The model receives ``full_state[..., 3:45]`` plus the 12-d action history and
-predicts the original 45-d next state, contacts, and termination.
+For supervised real datasets the model receives all 45 state dimensions,
+including the measured/estimated base linear velocity, plus the 12-d action
+history and predicts the 45-d next state, contacts, and termination.
 """
 
 from __future__ import annotations
@@ -64,7 +65,7 @@ def main() -> None:
     masked_policy_obs_indices = go2_joint_names_to_policy_obs_indices(masked_joint_names)
 
     configured_input_drop = normalize_action_mask_indices(
-        cfg.system_dynamics.get("dropped_state_indices", GO2_BASE_LIN_VEL_STATE_INDICES),
+        cfg.system_dynamics.get("dropped_state_indices", []),
         action_dim=45,
     )
     configured_output_drop = normalize_action_mask_indices(
@@ -76,7 +77,7 @@ def main() -> None:
         action_dim=45,
     )
     input_dropped_state_indices = tuple(
-        sorted(set(GO2_BASE_LIN_VEL_STATE_INDICES) | set(configured_input_drop) | set(masked_state_indices))
+        sorted(set(configured_input_drop) | set(masked_state_indices))
     )
     output_dropped_state_indices = tuple(sorted(set(configured_output_drop) | set(masked_state_indices)))
     action_mask_indices_cfg = normalize_action_mask_indices(cfg.get("action_mask_indices", []), action_dim=12)
@@ -120,6 +121,15 @@ def main() -> None:
     dataset = load_mixed_dataset(dataset_path)
     dataset_metadata = dataset.get("metadata") or {}
     if bool(dataset_metadata.get("base_lin_vel_supervised", False)):
+        dropped_velocity_indices = sorted(
+            set(input_dropped_state_indices) & set(GO2_BASE_LIN_VEL_STATE_INDICES)
+        )
+        if dropped_velocity_indices:
+            raise ValueError(
+                "Dataset provides supervised base_lin_vel estimates, but the training config "
+                f"drops input indices {dropped_velocity_indices}. Set "
+                "system_dynamics.dropped_state_indices=[] for this dataset."
+            )
         ignored_velocity_indices = sorted(
             set(state_loss_ignored_indices) & set(GO2_BASE_LIN_VEL_STATE_INDICES)
         )

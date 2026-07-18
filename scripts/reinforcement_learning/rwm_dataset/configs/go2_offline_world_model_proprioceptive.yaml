@@ -16,12 +16,12 @@ policy_observation_mask_indices: []
 
 system_dynamics:
   model_type: go2_proprioceptive
-  input_state_dim: 42
+  input_state_dim: 45
   output_state_dim: 45
   action_dim: 12
   full_state_dim: 45
   full_action_dim: 12
-  dropped_state_indices: [0, 1, 2]
+  dropped_state_indices: []
   output_dropped_state_indices: []
   state_loss_ignored_indices: []
   dropped_action_indices: []

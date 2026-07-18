@@ -107,6 +107,18 @@ class Go2MixedDatasetBuilder:
         }
         if bool((metadata.get("trace_candidates") or {}).get("enabled", False)):
             self.data["trace_reset_reconstruction_errors"] = []
+            self.data["trace_valid_masks"] = []
+        if bool(metadata.get("save_trace_snapshots", False)):
+            for key in (
+                "sim_root_states_local",
+                "sim_joint_positions",
+                "sim_joint_velocities",
+                "sim_action_histories",
+                "sim_prev_action_histories",
+                "sim_prev_prev_action_histories",
+                "sim_snapshot_commands",
+            ):
+                self.data[key] = []
 
     @property
     def num_time_steps(self) -> int:
@@ -139,6 +151,8 @@ class Go2MixedDatasetBuilder:
         actuator_delay_substep: torch.Tensor | None = None,
         noisy_actor_observation: torch.Tensor | None = None,
         trace_reset_reconstruction_error: torch.Tensor | None = None,
+        trace_valid_mask: torch.Tensor | None = None,
+        simulator_snapshot: dict[str, torch.Tensor] | None = None,
     ) -> None:
         self.data["observations"].append(_detach_cpu(obs, torch.float32))
         self.data["next_observations"].append(_detach_cpu(next_obs, torch.float32))
@@ -180,6 +194,28 @@ class Go2MixedDatasetBuilder:
             self.data["trace_reset_reconstruction_errors"].append(
                 _detach_cpu(trace_reset_reconstruction_error, torch.float32)
             )
+            if trace_valid_mask is None:
+                trace_valid_mask = torch.ones(num_envs, device=action.device, dtype=torch.bool)
+            self.data["trace_valid_masks"].append(_detach_cpu(trace_valid_mask, torch.bool))
+        if "sim_root_states_local" in self.data:
+            if simulator_snapshot is None:
+                raise ValueError("save_trace_snapshots=True requires simulator_snapshot on every add().")
+            snapshot_mapping = {
+                "sim_root_states_local": "root_state_local",
+                "sim_joint_positions": "joint_position",
+                "sim_joint_velocities": "joint_velocity",
+                "sim_action_histories": "action",
+                "sim_prev_action_histories": "prev_action",
+                "sim_prev_prev_action_histories": "prev_prev_action",
+                "sim_snapshot_commands": "command",
+            }
+            missing = [source for source in snapshot_mapping.values() if source not in simulator_snapshot]
+            if missing:
+                raise ValueError(f"simulator_snapshot is missing keys: {missing}")
+            for output_key, source_key in snapshot_mapping.items():
+                self.data[output_key].append(
+                    _detach_cpu(simulator_snapshot[source_key], torch.float32)
+                )
 
     def save(self, path: str | Path) -> None:
         path = Path(path)
@@ -248,6 +284,12 @@ class OfflineSequenceSampler:
         self.next_states = stack_time_key(dataset, "next_states").float()
         self.contacts = stack_time_key(dataset, "contacts").float()
         self.terminations = stack_time_key(dataset, "terminations").float()
+        episode_values = dataset.get("episode_ids")
+        self.episode_ids = (
+            stack_time_key(dataset, "episode_ids").long()
+            if episode_values is not None
+            else None
+        )
         self.num_time_steps = int(self.states.shape[0])
         self.num_envs = int(self.states.shape[1])
         confidence_values = dataset.get("next_base_lin_vel_confidence")
@@ -280,12 +322,6 @@ class OfflineSequenceSampler:
             ):
                 raise ValueError("next_base_lin_vel_confidence must be in [0, 1]")
             self.has_base_lin_vel_confidence = True
-        episode_values = dataset.get("episode_ids")
-        self.episode_ids = (
-            stack_time_key(dataset, "episode_ids").long()
-            if episode_values is not None
-            else None
-        )
         self.state_dim = int(self.states.shape[-1])
         self.action_dim = int(self.actions.shape[-1])
         self.contact_dim = int(self.contacts.shape[-1])
@@ -422,8 +458,8 @@ class OfflineSequenceSampler:
             "action_dim": self.action_dim,
             "contact_dim": self.contact_dim,
             "termination_dim": self.termination_dim,
-            "has_base_lin_vel_confidence": self.has_base_lin_vel_confidence,
             "train_sequences": int(self.train_indices.shape[0]),
             "val_sequences": int(self.val_indices.shape[0]),
+            "has_base_lin_vel_confidence": self.has_base_lin_vel_confidence,
             "source_metadata": self.dataset.get("metadata") or {},
         }

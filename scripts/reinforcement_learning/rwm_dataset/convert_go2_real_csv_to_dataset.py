@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import sys
@@ -78,6 +79,8 @@ class LoggedRow:
     observation: torch.Tensor
     command: torch.Tensor
     contact: torch.Tensor
+    foot_force: torch.Tensor
+    contact_source: str
     action_source: str
     exact_policy_observation: bool
     base_lin_vel_confidence: float = 0.0
@@ -93,6 +96,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-gap-seconds", type=float, default=0.06)
     parser.add_argument("--max-action-alignment-error", type=float, default=1e-3)
     parser.add_argument("--contact-force-threshold", type=float, default=10.0)
+    parser.add_argument(
+        "--contact-source",
+        choices=("auto", "logged", "recompute"),
+        default="auto",
+        help=(
+            "Use logged foot_contact, recompute it from foot_force, or prefer logged "
+            "when available. v2 sensitivity runs should explicitly use recompute."
+        ),
+    )
+    parser.add_argument("--condition-id", default=None)
+    parser.add_argument("--robot-id", default=None)
+    parser.add_argument("--collection-id", default=None)
     parser.add_argument("--velocity-estimator-ema-alpha", type=float, default=0.35)
     parser.add_argument("--velocity-estimator-consensus-threshold", type=float, default=0.12)
     parser.add_argument(
@@ -186,6 +201,14 @@ def _optional_float(row: dict[str, str], name: str) -> float | None:
         return None
     value = float(raw)
     return value if math.isfinite(value) else None
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _scale_joystick(value: float, limits: tuple[float, float]) -> float:
@@ -321,10 +344,19 @@ def _parse_logged_row(
         # The last-action block is patched after episode segmentation.
         observation[:] = torch.tensor(ang_vel + gravity + command + q_rel + dq + [0.0] * 12)
 
-    if _has_vector(fieldnames, "foot_contact", CONTACT_DIM):
+    has_logged_contact = _has_vector(fieldnames, "foot_contact", CONTACT_DIM)
+    has_foot_force = _has_vector(fieldnames, "foot_force", CONTACT_DIM)
+    if not has_foot_force:
+        raise ValueError("CSV lacks foot_force_0..3; v2 conversion requires raw foot force")
+    force = _vector(row, "foot_force", CONTACT_DIM)
+    contact_source = str(args.contact_source)
+    if contact_source == "auto":
+        contact_source = "logged" if has_logged_contact else "recompute"
+    if contact_source == "logged":
+        if not has_logged_contact:
+            raise ValueError("--contact-source logged requested but foot_contact_0..3 is missing")
         contact_sdk = _vector(row, "foot_contact", CONTACT_DIM)
     else:
-        force = _vector(row, "foot_force", CONTACT_DIM)
         contact_sdk = [float(value > args.contact_force_threshold) for value in force]
 
     policy_state = _optional_float(row, "policy_state_id")
@@ -345,6 +377,8 @@ def _parse_logged_row(
         observation=observation,
         command=torch.tensor(command, dtype=torch.float32),
         contact=torch.tensor(contact_sdk, dtype=torch.float32),
+        foot_force=torch.tensor(force, dtype=torch.float32),
+        contact_source=contact_source,
         action_source=action_source,
         exact_policy_observation=has_policy_obs,
     )
@@ -453,7 +487,8 @@ def _build_dataset(rows: list[LoggedRow], spec: DeploySpec, args: argparse.Names
         "observations", "next_observations", "commands", "rewards", "dones",
         "timeouts", "prev_actions", "episode_ids", "timesteps", "collector_types",
         "noisy_actor_observations", "base_lin_vel_confidence",
-        "next_base_lin_vel_confidence", "base_lin_vel_raw",
+        "next_base_lin_vel_confidence", "base_lin_vel_raw", "foot_forces",
+        "source_rows", "source_file_ids",
     )
     dataset: dict[str, Any] = {key: [] for key in list_keys}
     dataset.update(
@@ -475,6 +510,8 @@ def _build_dataset(rows: list[LoggedRow], spec: DeploySpec, args: argparse.Names
     action_alignment_errors: list[float] = []
     episode_ids_seen: set[int] = set()
     previous_action = torch.zeros(ACTION_DIM)
+    source_paths = sorted({row.source for row in rows})
+    source_file_ids = {path: index for index, path in enumerate(source_paths)}
 
     for idx in range(len(rows) - 1):
         current = rows[idx]
@@ -500,6 +537,13 @@ def _build_dataset(rows: list[LoggedRow], spec: DeploySpec, args: argparse.Names
         _append(dataset, "raw_actions", current.raw_action)
         _append(dataset, "next_states", following.state)
         _append(dataset, "contacts", following.contact)
+        _append(dataset, "foot_forces", following.foot_force)
+        _append(dataset, "source_rows", torch.tensor(current.source_row, dtype=torch.long))
+        _append(
+            dataset,
+            "source_file_ids",
+            torch.tensor(source_file_ids[current.source], dtype=torch.long),
+        )
         _append(dataset, "terminations", termination)
         _append(dataset, "observations", current.observation)
         _append(dataset, "next_observations", following.observation)
@@ -554,7 +598,14 @@ def _build_dataset(rows: list[LoggedRow], spec: DeploySpec, args: argparse.Names
         "obs_dim": OBS_DIM,
         "source": "real_go2_csv",
         "conversion_kind": "exact" if approximate_rows == 0 else "approximate_legacy",
-        "source_csvs": sorted({row.source for row in rows}),
+        "source_csvs": source_paths,
+        "source_file_id_to_csv": {str(index): path for path, index in source_file_ids.items()},
+        "source_csv_sha256": {
+            path: _sha256(Path(path)) for path in sorted({row.source for row in rows})
+        },
+        "condition_id": args.condition_id,
+        "robot_id": args.robot_id,
+        "collection_id": args.collection_id,
         "num_input_rows": len(rows),
         "num_time_steps": transitions,
         "num_transitions": transitions,
@@ -590,6 +641,12 @@ def _build_dataset(rows: list[LoggedRow], spec: DeploySpec, args: argparse.Names
             "minimum_confidence_fraction": minimum_confidence_fraction,
             "estimate_abs_max": float(estimated_velocity.abs().max()),
         },
+        "contact_source": sorted({row.contact_source for row in rows}),
+        "contact_force_threshold": (
+            float(args.contact_force_threshold)
+            if any(row.contact_source == "recompute" for row in rows)
+            else None
+        ),
         "policy_observation_kind": "proprioceptive_45d",
         "policy_observation_layout": [
             "base_ang_vel_b[3]", "projected_gravity_b[3]", "command[3]",
@@ -633,7 +690,8 @@ def _validate_dataset(dataset: dict[str, Any]) -> dict[str, Any]:
         "contacts": (1, 4), "terminations": (1, 1),
         "observations": (1, 45), "next_observations": (1, 45),
         "base_lin_vel_confidence": (1,), "next_base_lin_vel_confidence": (1,),
-        "base_lin_vel_raw": (1, 3),
+        "base_lin_vel_raw": (1, 3), "foot_forces": (1, 4), "source_rows": (1,),
+        "source_file_ids": (1,),
     }
     for key, shape in expected_shapes.items():
         if tuple(dataset[key][0].shape) != shape:
@@ -674,6 +732,7 @@ def main() -> None:
     validation = _validate_dataset(dataset)
     dataset["metadata"]["rejected_input_rows"] = rejected_rows
     dataset["metadata"]["deploy_yaml"] = str(deploy_yaml)
+    dataset["metadata"]["deploy_yaml_sha256"] = _sha256(deploy_yaml)
     output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(dataset, output)
 

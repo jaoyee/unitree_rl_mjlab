@@ -13,8 +13,9 @@ REPLAY_KEYS = ("observation", "action", "reward", "terminated", "truncated", "ne
 class TraceReplaySampler:
     def __init__(self, path: str | Path, *, seed: int = 0) -> None:
         artifact = torch.load(path, map_location="cpu", weights_only=False)
-        if artifact.get("format_version") != "go2_trace_replay_v1":
+        if artifact.get("format_version") not in {"go2_trace_replay_v1", "go2_trace_replay_v2"}:
             raise ValueError(f"Unsupported TRACE replay artifact: {path}")
+        self.format_version = str(artifact.get("format_version"))
         self.data: dict[str, torch.Tensor] = {}
         for key in REPLAY_KEYS:
             value = artifact.get(key)

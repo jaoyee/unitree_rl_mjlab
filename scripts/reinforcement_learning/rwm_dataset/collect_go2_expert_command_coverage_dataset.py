@@ -50,6 +50,9 @@ except ImportError:
         env_cfg.scene.entities["robot"] = get_go2_robot_cfg(joint_strength_scales=scales)
         return scales
 from scripts.reinforcement_learning.rwm_flashsac.agent import create_go2_flashsac_agent
+from scripts.reinforcement_learning.rwm_flashsac.agent_proprioceptive import (
+    create_go2_flashsac_proprioceptive_agent,
+)
 from scripts.reinforcement_learning.rwm_flashsac.utils import (
     configure_low_thread_env,
     load_config as load_flashsac_config,
@@ -64,7 +67,15 @@ from scripts.reinforcement_learning.rwm_flashsac.world_model_env_proprioceptive 
     PROPRIOCEPTIVE_ACTOR_OBS_DIM,
     proprioceptive_obs_t,
 )
-from scripts.reinforcement_learning.rwm_trace.simulator_reset import reset_go2_from_rwm_state
+from scripts.reinforcement_learning.rwm_trace.simulator_reset import (
+    SNAPSHOT_VERSION,
+    canonical_snapshot_from_rwm_state,
+    capture_go2_simulator_snapshot,
+    repeat_snapshot_rows,
+    restore_go2_simulator_snapshot,
+    step_without_automatic_reset,
+    synchronize_branch_domain_parameters,
+)
 from src.tasks.rwm_velocity.mdp.extractors import Go2RWMExtractor, make_go2_policy_obs
 
 
@@ -229,6 +240,27 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--trace_rollout_length", type=int, default=20)
     parser.add_argument("--trace_trajectories_per_state", type=int, default=4)
+    parser.add_argument(
+        "--trace_reset_mode",
+        choices=("exact_snapshot", "canonical_real_projection"),
+        default="exact_snapshot",
+        help=(
+            "exact_snapshot requires simulator snapshot fields in trace_reset_dataset. "
+            "canonical_real_projection is the explicit approximate mode for real logs."
+        ),
+    )
+    parser.add_argument(
+        "--save_trace_snapshots",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Save reset-relevant MJLab snapshots with ordinary simulator datasets.",
+    )
+    parser.add_argument(
+        "--trace_identity_tolerance",
+        type=float,
+        default=1.0e-4,
+        help="Maximum repeated one-step state error allowed after restoring the same snapshot/action.",
+    )
     parser.add_argument(
         "--trace_action_temperature",
         type=float,
@@ -490,7 +522,12 @@ def _load_expert_agent(
         if device.startswith("cpu"):
             cfg.agent.use_amp = False
         obs_space, action_space = make_vector_spaces(num_envs, obs_dim=48, action_dim=action_dim)
-        agent = create_go2_flashsac_agent(obs_space, action_space, make_flashsac_config(cfg, device=device))
+        create_agent_fn = (
+            create_go2_flashsac_proprioceptive_agent
+            if bool(cfg.agent.get("asymmetric_observation", False))
+            else create_go2_flashsac_agent
+        )
+        agent = create_agent_fn(obs_space, action_space, make_flashsac_config(cfg, device=device))
         agent.load(str(ckpt_dir))
         return LoadedPolicy(agent=agent, observation_kind="rwm", config_path=rwm_cfg_path)
 
@@ -871,15 +908,25 @@ def main() -> None:
     dataset_obs_kind = _resolve_dataset_obs_kind(str(args.dataset_obs_kind), actor_dim=actor_dim)
     dataset_obs_dim = PROPRIOCEPTIVE_ACTOR_OBS_DIM if dataset_obs_kind == "proprioceptive" else int(dims.policy_obs_dim)
     trace_source_states: torch.Tensor | None = None
+    trace_source_next_states: torch.Tensor | None = None
     trace_start_state_ids: torch.Tensor | None = None
+    trace_source_commands: torch.Tensor | None = None
+    trace_source_previous_actions: torch.Tensor | None = None
+    trace_source_actions: torch.Tensor | None = None
+    trace_source_snapshot: dict[str, Any] | None = None
     if args.trace_reset_dataset:
         if int(args.trace_rollout_length) < 1 or int(args.trace_trajectories_per_state) < 1:
             raise ValueError("TRACE rollout length and trajectories per state must be positive.")
         trace_source_path = resolve_repo_path(str(args.trace_reset_dataset))
         trace_source_dataset = torch.load(trace_source_path, map_location="cpu", weights_only=False)
         source_states = stack_time_key(trace_source_dataset, "states").reshape(-1, int(dims.state_dim)).float()
+        source_next_states = stack_time_key(trace_source_dataset, "next_states").reshape(
+            -1, int(dims.state_dim)
+        ).float()
         if source_states.shape[-1] != 45:
             raise ValueError(f"TRACE reset dataset must contain 45D states, got {source_states.shape[-1]}.")
+        if len(source_next_states) != len(source_states):
+            raise ValueError("TRACE source states and next_states must have identical flattened lengths.")
         num_unique = int(np.ceil(int(args.num_envs) / int(args.trace_trajectories_per_state)))
         generator = torch.Generator(device="cpu").manual_seed(int(args.seed) + 1701)
         if len(source_states) >= num_unique:
@@ -890,6 +937,56 @@ def main() -> None:
             : int(args.num_envs)
         ]
         trace_source_states = source_states[trace_start_state_ids].to(env.device)
+        trace_source_next_states = source_next_states[trace_start_state_ids].to(env.device)
+        source_commands = stack_time_key(trace_source_dataset, "commands").reshape(-1, 3).float()
+        source_previous_actions = stack_time_key(trace_source_dataset, "prev_actions").reshape(
+            -1, action_dim
+        ).float()
+        source_actions = stack_time_key(trace_source_dataset, "actions").reshape(-1, action_dim).float()
+        if (
+            len(source_commands) != len(source_states)
+            or len(source_previous_actions) != len(source_states)
+            or len(source_actions) != len(source_states)
+        ):
+            raise ValueError(
+                "TRACE source states/next_states/commands/prev_actions/actions must have identical flattened lengths."
+            )
+        trace_source_commands = source_commands[trace_start_state_ids].to(env.device)
+        trace_source_previous_actions = source_previous_actions[trace_start_state_ids].to(env.device)
+        trace_source_actions = source_actions[trace_start_state_ids].to(env.device)
+        if args.trace_reset_mode == "exact_snapshot":
+            snapshot_keys = {
+                "root_state_local": "sim_root_states_local",
+                "joint_position": "sim_joint_positions",
+                "joint_velocity": "sim_joint_velocities",
+                "action": "sim_action_histories",
+                "prev_action": "sim_prev_action_histories",
+                "prev_prev_action": "sim_prev_prev_action_histories",
+                "command": "sim_snapshot_commands",
+            }
+            missing = [dataset_key for dataset_key in snapshot_keys.values() if trace_source_dataset.get(dataset_key) is None]
+            if missing:
+                raise ValueError(
+                    "TRACE exact_snapshot mode requires simulator snapshots; missing "
+                    f"{missing}. Regenerate the simulator source with --save_trace_snapshots."
+                )
+            leader_snapshot: dict[str, Any] = {"snapshot_version": SNAPSHOT_VERSION}
+            for snapshot_key, dataset_key in snapshot_keys.items():
+                values = stack_time_key(trace_source_dataset, dataset_key).reshape(
+                    len(source_states), -1
+                )
+                leader_snapshot[snapshot_key] = values[selected_ids]
+            trace_source_snapshot = {
+                key: value.to(env.device) if isinstance(value, torch.Tensor) else value
+                for key, value in repeat_snapshot_rows(
+                    leader_snapshot,
+                    int(args.trace_trajectories_per_state),
+                ).items()
+            }
+            # Keep source command/action columns authoritative even if an old
+            # snapshot was captured with inconsistent auxiliary fields.
+            trace_source_snapshot["command"] = trace_source_commands
+            trace_source_snapshot["action"] = trace_source_previous_actions
 
     expert_agent = _maybe_load_agent(
         None if args.expert_policy_path is None else str(args.expert_policy_path),
@@ -912,11 +1009,7 @@ def main() -> None:
     mode_weights = _parse_mode_weights(args.command_mode_weights, modes, env.device)
     collector_mix = parse_collector_mix(str(args.collector_mix))
     if expert_agent is None:
-        non_random = {
-            name: weight
-            for name, weight in collector_mix.items()
-            if name != "random" and weight > 0.0
-        }
+        non_random = {name: weight for name, weight in collector_mix.items() if name != "random" and weight > 0.0}
         if non_random:
             raise ValueError(f"collector_mix uses policy-based collectors {non_random}, but expert_policy_path is empty.")
     x_range = (float(args.x_range[0]), float(args.x_range[1]))
@@ -1006,9 +1099,21 @@ def main() -> None:
             "action_temperature": (
                 float(args.trace_action_temperature) if trace_source_states is not None else None
             ),
-            "reset_is_exact": False,
-            "unrecoverable_fields": ["root_position", "root_yaw", "actuator_force"],
+            "reset_mode": str(args.trace_reset_mode) if trace_source_states is not None else None,
+            "reset_is_exact": bool(
+                trace_source_states is not None and args.trace_reset_mode == "exact_snapshot"
+            ),
+            "snapshot_version": SNAPSHOT_VERSION if trace_source_states is not None else None,
+            "controlled_branch_domain": bool(trace_source_states is not None),
+            "command_from_source_transition": bool(trace_source_states is not None),
+            "stop_on_done": bool(trace_source_states is not None),
+            "unrecoverable_fields": (
+                []
+                if trace_source_states is not None and args.trace_reset_mode == "exact_snapshot"
+                else ["root_height", "root_yaw", "simulator_hidden_state"]
+            ),
         },
+        "save_trace_snapshots": bool(args.save_trace_snapshots),
     }
 
     builder = _new_builder(args, dims, metadata)
@@ -1044,6 +1149,8 @@ def main() -> None:
         device=env.device,
     )
     command_ages = torch.zeros(int(args.num_envs), dtype=torch.long, device=env.device)
+    if trace_source_commands is not None:
+        commands = trace_source_commands.clone()
     _force_commands(env.unwrapped, commands)
 
     trace_reset_error = torch.full(
@@ -1052,26 +1159,120 @@ def main() -> None:
         device=env.device,
     )
 
+    realized_trace_snapshot: dict[str, Any] | None = None
+
     def reset_trace_candidates() -> None:
-        nonlocal obs_dict, trace_reset_error
+        nonlocal obs_dict, trace_reset_error, realized_trace_snapshot
         if trace_source_states is None:
             return
-        reset_go2_from_rwm_state(
+        all_ids = torch.arange(int(args.num_envs), device=env.device)
+        synchronize_branch_domain_parameters(
             env.unwrapped,
-            trace_source_states,
-            torch.arange(int(args.num_envs), device=env.device),
+            int(args.trace_trajectories_per_state),
         )
+        if args.trace_reset_mode == "exact_snapshot":
+            delay_state = friend_dr_runtime_snapshot(env.unwrapped).get("actuator_delay_substeps")
+            if delay_max > 0 or (delay_state is not None and bool((delay_state != 0).any())):
+                raise RuntimeError(
+                    "exact_snapshot currently requires zero action/actuator delay; "
+                    "delay history is not present in the source snapshot."
+                )
+            if trace_source_snapshot is None:
+                raise RuntimeError("exact_snapshot mode was selected without a loaded snapshot.")
+            realized_trace_snapshot = trace_source_snapshot
+        else:
+            branch_count = int(args.trace_trajectories_per_state)
+            leader_ids = torch.arange(0, int(args.num_envs), branch_count, device=env.device)
+            leader_snapshot = canonical_snapshot_from_rwm_state(
+                env.unwrapped,
+                trace_source_states[leader_ids],
+                trace_source_commands[leader_ids],
+                trace_source_previous_actions[leader_ids],
+                leader_ids,
+            )
+            realized_trace_snapshot = repeat_snapshot_rows(leader_snapshot, branch_count)
+        restore_go2_simulator_snapshot(env.unwrapped, realized_trace_snapshot, all_ids)
         reconstructed = extractor.extract_state()
+        compared_width = 45 if args.trace_reset_mode == "exact_snapshot" else 33
         trace_reset_error = torch.linalg.norm(
-            reconstructed[:, :33] - trace_source_states[:, :33],
+            reconstructed[:, :compared_width] - trace_source_states[:, :compared_width],
             dim=-1,
         )
         obs_dict = env.unwrapped.observation_manager.compute()
 
     reset_trace_candidates()
 
-    last_actions = torch.zeros(int(args.num_envs), action_dim, device=env.device)
+    last_actions = (
+        trace_source_previous_actions.clone()
+        if trace_source_previous_actions is not None
+        else torch.zeros(int(args.num_envs), action_dim, device=env.device)
+    )
     action_delay_history = torch.zeros(delay_max + 1, int(args.num_envs), action_dim, device=env.device)
+    if trace_source_previous_actions is not None:
+        action_delay_history[:] = trace_source_previous_actions.unsqueeze(0)
+    trace_active = torch.ones(int(args.num_envs), dtype=torch.bool, device=env.device)
+
+    if trace_source_states is not None:
+        if args.trace_identity_tolerance <= 0.0:
+            raise ValueError("trace_identity_tolerance must be positive.")
+        if (
+            realized_trace_snapshot is None
+            or trace_source_actions is None
+            or trace_source_next_states is None
+        ):
+            raise RuntimeError("TRACE identity check requires realized snapshots and source actions.")
+        identity_ids = torch.arange(int(args.num_envs), device=env.device)
+        restore_go2_simulator_snapshot(env.unwrapped, realized_trace_snapshot, identity_ids)
+        step_without_automatic_reset(env.unwrapped, trace_source_actions)
+        identity_next_a = extractor.extract_state().clone()
+        identity_term_a = extractor.extract_termination().clone()
+        restore_go2_simulator_snapshot(env.unwrapped, realized_trace_snapshot, identity_ids)
+        step_without_automatic_reset(env.unwrapped, trace_source_actions)
+        identity_next_b = extractor.extract_state().clone()
+        identity_term_b = extractor.extract_termination().clone()
+        identity_error = torch.max(torch.abs(identity_next_a - identity_next_b), dim=-1).values
+        identity_max_error = float(identity_error.max())
+        if identity_max_error > float(args.trace_identity_tolerance):
+            raise RuntimeError(
+                "TRACE repeated one-step identity failed: "
+                f"max_state_error={identity_max_error:.6g} > tolerance={args.trace_identity_tolerance:.6g}."
+            )
+        if not torch.equal(identity_term_a.bool(), identity_term_b.bool()):
+            raise RuntimeError("TRACE repeated one-step identity produced inconsistent terminations.")
+        source_next_error = torch.max(
+            torch.abs(identity_next_a - trace_source_next_states), dim=-1
+        ).values
+        source_next_max_error = float(source_next_error.max())
+        source_match_available = args.trace_reset_mode == "exact_snapshot"
+        if source_match_available and source_next_max_error > float(args.trace_identity_tolerance):
+            raise RuntimeError(
+                "TRACE exact reset failed the dataset transition identity check: "
+                f"sim(snapshot, source_action) differs from dataset next_state by "
+                f"{source_next_max_error:.6g} > tolerance={args.trace_identity_tolerance:.6g}."
+            )
+        metadata["trace_candidates"]["one_step_identity"] = {
+            "kind": "repeated_snapshot_same_action",
+            "max_state_abs_error": identity_max_error,
+            "tolerance": float(args.trace_identity_tolerance),
+            "passed": True,
+        }
+        metadata["trace_candidates"]["source_transition_identity"] = {
+            "kind": "sim_snapshot_source_action_vs_dataset_next_state",
+            "available": bool(source_match_available),
+            "max_state_abs_error": source_next_max_error if source_match_available else None,
+            "tolerance": float(args.trace_identity_tolerance) if source_match_available else None,
+            "passed": True if source_match_available else None,
+            "unavailable_reason": (
+                None
+                if source_match_available
+                else "real logs do not contain an exact simulator snapshot"
+            ),
+        }
+        reset_trace_candidates()
+        last_actions.copy_(trace_source_previous_actions)
+        action_delay_history.copy_(
+            trace_source_previous_actions.unsqueeze(0).expand_as(action_delay_history)
+        )
     env_action_scale = _sample_env_action_scale(
         int(args.num_envs),
         action_dim,
@@ -1148,12 +1349,22 @@ def main() -> None:
 
     for collection_step in tqdm.trange(total_steps, smoothing=0.1, mininterval=0.5):
         _force_commands(env.unwrapped, commands)
+        transition_valid_mask = trace_active.clone()
         transition_episode_ids = episode_ids.clone()
         transition_timesteps = timesteps.clone()
         transition_collector_ids = collector_ids.clone()
         state = extractor.extract_state()
         command = commands.clone()
         prev_action = last_actions.clone()
+        transition_simulator_snapshot = (
+            capture_go2_simulator_snapshot(
+                env.unwrapped,
+                torch.arange(int(args.num_envs), device=env.device),
+                command=command,
+            )
+            if args.save_trace_snapshots
+            else None
+        )
         full_obs_t = make_go2_policy_obs(state, command, prev_action)
         obs_t = _dataset_obs_t(full_obs_t, kind=dataset_obs_kind)
         observations_by_kind = {
@@ -1189,6 +1400,8 @@ def main() -> None:
                 float(args.trace_action_temperature) if trace_source_states is not None else None
             ),
         )
+        if trace_source_states is not None:
+            action_t[~trace_active] = 0.0
         env_action_t, env_action_delay_steps = _apply_env_step_action_interface(
             action_t,
             args=args,
@@ -1199,7 +1412,13 @@ def main() -> None:
             delay_max=delay_max,
         )
 
-        obs_dict, rewards, terminateds, truncateds, _extras = env.step(env_action_t)
+        if trace_source_states is not None:
+            obs_dict, rewards, terminateds, truncateds, _extras = step_without_automatic_reset(
+                env.unwrapped,
+                env_action_t,
+            )
+        else:
+            obs_dict, rewards, terminateds, truncateds, _extras = env.step(env_action_t)
         actuator_delay_substeps = friend_dr_runtime_snapshot(env.unwrapped).get(
             "actuator_delay_substeps",
             torch.zeros(int(args.num_envs), device=env.device, dtype=torch.long),
@@ -1208,38 +1427,49 @@ def main() -> None:
         contact = extractor.extract_contact()
         termination = extractor.extract_termination()
         done = terminateds | truncateds
+        if trace_source_states is not None:
+            done = done & trace_active
 
+        counted_collector_ids = collector_ids[transition_valid_mask] if trace_source_states is not None else collector_ids
+        counted_mode_ids = mode_ids[transition_valid_mask] if trace_source_states is not None else mode_ids
         collector_counts += torch.bincount(
-            collector_ids.detach().cpu(),
+            counted_collector_ids.detach().cpu(),
             minlength=len(COLLECTOR_ID_TO_NAME),
         )
-        mode_counts += torch.bincount(mode_ids.detach().cpu(), minlength=len(modes))
+        mode_counts += torch.bincount(counted_mode_ids.detach().cpu(), minlength=len(modes))
 
         returns += rewards
         lengths += 1
         done_ids = done.nonzero(as_tuple=False).flatten()
-        resample_ids = (command_ages + 1 >= intervals).nonzero(as_tuple=False).flatten()
+        resample_ids = (
+            torch.empty(0, device=env.device, dtype=torch.long)
+            if trace_source_states is not None
+            else (command_ages + 1 >= intervals).nonzero(as_tuple=False).flatten()
+        )
         if done_ids.numel() > 0:
             completed_returns.extend(returns[done_ids].detach().cpu().tolist())
             completed_lengths.extend(lengths[done_ids].detach().cpu().float().tolist())
-            termination_count += int(terminateds.sum().item())
-            timeout_count += int(truncateds.sum().item())
+            termination_count += int((terminateds & transition_valid_mask).sum().item())
+            timeout_count += int((truncateds & transition_valid_mask).sum().item())
             returns[done_ids] = 0.0
             lengths[done_ids] = 0
-            new_ids = torch.arange(
-                next_episode_id,
-                next_episode_id + int(done_ids.numel()),
-                device=env.device,
-                dtype=torch.long,
-            )
-            next_episode_id += int(done_ids.numel())
-            episode_ids[done_ids] = new_ids
-            _append_table_chunks(
-                episode_domain_chunks,
-                _episode_domain_rows(env, env_ids=done_ids, episode_ids=new_ids),
-            )
-            timesteps[done_ids] = 0
-            resample_ids = torch.unique(torch.cat([resample_ids, done_ids]))
+            if trace_source_states is not None:
+                trace_active[done_ids] = False
+            else:
+                new_ids = torch.arange(
+                    next_episode_id,
+                    next_episode_id + int(done_ids.numel()),
+                    device=env.device,
+                    dtype=torch.long,
+                )
+                next_episode_id += int(done_ids.numel())
+                episode_ids[done_ids] = new_ids
+                _append_table_chunks(
+                    episode_domain_chunks,
+                    _episode_domain_rows(env, env_ids=done_ids, episode_ids=new_ids),
+                )
+                timesteps[done_ids] = 0
+                resample_ids = torch.unique(torch.cat([resample_ids, done_ids]))
             action_delay_history[:, done_ids] = 0.0
             env_action_scale[done_ids] = _sample_env_action_scale(
                 int(done_ids.numel()),
@@ -1311,12 +1541,30 @@ def main() -> None:
             timestep=transition_timesteps,
             collector_type=transition_collector_ids,
             trace_reset_reconstruction_error=trace_reset_error,
+            trace_valid_mask=transition_valid_mask,
+            simulator_snapshot=transition_simulator_snapshot,
         )
         flush_part(force=False)
+
+        # Keep terminated inactive worlds numerically safe without admitting
+        # post-reset transitions into the proposal trajectory.
+        if trace_source_states is not None and done_ids.numel() > 0:
+            if realized_trace_snapshot is None:
+                raise RuntimeError("TRACE realized snapshot is unavailable after reset.")
+            done_snapshot = {
+                "snapshot_version": SNAPSHOT_VERSION,
+                **{
+                    key: value[done_ids]
+                    for key, value in realized_trace_snapshot.items()
+                    if isinstance(value, torch.Tensor)
+                },
+            }
+            restore_go2_simulator_snapshot(env.unwrapped, done_snapshot, done_ids)
 
         trace_boundary = (
             trace_source_states is not None
             and (collection_step + 1) % int(args.trace_rollout_length) == 0
+            and (collection_step + 1) < total_steps
         )
         if trace_boundary:
             reset_trace_candidates()
@@ -1332,19 +1580,13 @@ def main() -> None:
             timesteps.zero_()
             returns.zero_()
             lengths.zero_()
-            last_actions.zero_()
-            action_delay_history.zero_()
-            command_ages.zero_()
-            mode_ids = _sample_mode_ids(mode_weights, int(args.num_envs))
-            commands = _sample_commands_for_modes(
-                mode_ids,
-                modes,
-                x_range=x_range,
-                signed_x=bool(args.signed_x),
-                x_abs_range=x_abs_range,
-                y_abs_range=y_abs_range,
-                yaw_abs_range=yaw_abs_range,
+            last_actions.copy_(trace_source_previous_actions)
+            action_delay_history.copy_(
+                trace_source_previous_actions.unsqueeze(0).expand_as(action_delay_history)
             )
+            trace_active.fill_(True)
+            command_ages.zero_()
+            commands = trace_source_commands.clone()
             _force_commands(env.unwrapped, commands)
             _append_table_chunks(
                 episode_domain_chunks,
@@ -1360,9 +1602,15 @@ def main() -> None:
         dataset = merge_dataset_dicts(
             [torch.load(path, map_location="cpu", weights_only=False) for path in part_paths]
         )
+    valid_transition_count = (
+        int(stack_time_key(dataset, "trace_valid_masks").bool().sum())
+        if dataset.get("trace_valid_masks") is not None
+        else len(dataset["states"]) * int(dataset["num_envs"])
+    )
     dataset["metadata"].update(
         {
-            "actual_num_transitions": len(dataset["states"]) * int(dataset["num_envs"]),
+            "actual_num_transitions": valid_transition_count,
+            "rectangular_storage_rows": len(dataset["states"]) * int(dataset["num_envs"]),
             "collector_counts": {
                 COLLECTOR_ID_TO_NAME[idx]: int(count)
                 for idx, count in enumerate(collector_counts.tolist())
@@ -1372,16 +1620,8 @@ def main() -> None:
                 modes[idx].name: int(count)
                 for idx, count in enumerate(mode_counts.tolist())
             },
-            "mean_reward": (
-                float(np.mean(completed_returns))
-                if completed_returns
-                else float(returns.mean().item())
-            ),
-            "mean_episode_length": (
-                float(np.mean(completed_lengths))
-                if completed_lengths
-                else float(lengths.float().mean().item())
-            ),
+            "mean_reward": float(np.mean(completed_returns)) if completed_returns else float(returns.mean().item()),
+            "mean_episode_length": float(np.mean(completed_lengths)) if completed_lengths else float(lengths.float().mean().item()),
             "completed_episode_count": int(len(completed_lengths)),
             "termination_count": int(termination_count),
             "timeout_count": int(timeout_count),

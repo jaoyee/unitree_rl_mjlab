@@ -24,6 +24,7 @@ from scripts.reinforcement_learning.rwm_trace.scorer import (
     normalize_features,
     save_scorer_checkpoint,
 )
+from scripts.reinforcement_learning.rwm_trace.artifact_manifest import sha256_path
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,6 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--confidence_threshold", type=float, default=0.7)
     parser.add_argument("--val_ratio", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--allow_no_validation", action="store_true")
     return parser.parse_args()
 
 
@@ -58,6 +60,61 @@ def _summary(row: dict, side: str) -> dict:
         raise ValueError(f"Label row lacks trajectory {side} summary.")
     with open(path, "r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def _start_key(summary: dict) -> str:
+    return str(summary.get("start_state_key", summary.get("start_state_id", -1)))
+
+
+def _comparison_group_key(summary: dict) -> str:
+    """Return the indivisible train/validation group for one trajectory.
+
+    Dataset windows from one episode share a group even when their exact start
+    states differ. Simulator counterfactual branches normally share both keys.
+    """
+
+    return str(summary.get("comparison_group_key", _start_key(summary)))
+
+
+def _component_group_keys(summaries: list[dict], pair_count: int) -> list[str]:
+    """Group pairs by connected components of their comparison-group graph.
+
+    Splitting by the pair tuple leaks a start state whenever cross-start pairs
+    connect it to more than one partner.  Connected components are the smallest
+    units that guarantee no episode, start state, or trajectory crosses the
+    train/validation boundary.
+    """
+
+    parent: dict[str, str] = {}
+
+    def find(node: str) -> str:
+        parent.setdefault(node, node)
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    def union(left: str, right: str) -> None:
+        a, b = find(left), find(right)
+        if a != b:
+            parent[max(a, b)] = min(a, b)
+
+    starts: list[tuple[str, str]] = []
+    for index in range(pair_count):
+        left = _comparison_group_key(summaries[2 * index])
+        right = _comparison_group_key(summaries[2 * index + 1])
+        starts.append((left, right))
+        union(left, right)
+    return [find(left) for left, _ in starts]
+
+
+def _balanced_accuracy(prediction: torch.Tensor, label: torch.Tensor) -> float:
+    values = []
+    for target in (False, True):
+        mask = label.bool() == target
+        if bool(mask.any()):
+            values.append(float((prediction[mask] == label.bool()[mask]).float().mean()))
+    return float(np.mean(values)) if values else float("nan")
 
 
 def main() -> None:
@@ -78,17 +135,7 @@ def main() -> None:
     if not 0.0 <= args.val_ratio < 1.0:
         raise ValueError("--val_ratio must be in [0, 1).")
     summaries = [item for row in rows for item in (_summary(row, "i"), _summary(row, "j"))]
-    group_keys = [
-        tuple(
-            sorted(
-                (
-                    int(summaries[2 * index].get("start_state_id", -1)),
-                    int(summaries[2 * index + 1].get("start_state_id", -1)),
-                )
-            )
-        )
-        for index in range(len(rows))
-    ]
+    group_keys = _component_group_keys(summaries, len(rows))
     unique_groups = sorted(set(group_keys))
     rng = np.random.default_rng(args.seed)
     rng.shuffle(unique_groups)
@@ -97,8 +144,12 @@ def main() -> None:
     train_indices = [index for index, key in enumerate(group_keys) if key not in val_groups]
     val_indices = [index for index, key in enumerate(group_keys) if key in val_groups]
     if not train_indices:
-        train_indices = list(range(len(rows)))
-        val_indices = []
+        raise ValueError("Connected-component split produced no training pairs.")
+    if not val_indices and not args.allow_no_validation:
+        raise ValueError(
+            "Connected-component split produced no validation pairs. Use more independent "
+            "start states or disable cross-start pairs; do not report training accuracy as validation."
+        )
 
     features = feature_matrix(summaries, GO2_FEATURE_NAMES)
     train_feature_indices = [
@@ -132,6 +183,28 @@ def main() -> None:
             if val_indices
             else float("nan")
         )
+        train_balanced_accuracy = _balanced_accuracy(predictions[train_index_t], labels[train_index_t])
+        val_balanced_accuracy = (
+            _balanced_accuracy(predictions[val_index_t], labels[val_index_t])
+            if val_indices
+            else float("nan")
+        )
+        swapped_predictions = model(x_j) < model(x_i)
+        pair_swap_consistency = float((predictions == swapped_predictions).float().mean())
+
+    train_start_ids = {
+        _start_key(summaries[2 * index + side])
+        for index in train_indices
+        for side in (0, 1)
+    }
+    val_start_ids = {
+        _start_key(summaries[2 * index + side])
+        for index in val_indices
+        for side in (0, 1)
+    }
+    start_overlap = sorted(train_start_ids & val_start_ids)
+    if start_overlap:
+        raise RuntimeError(f"Scorer split leakage detected for start IDs: {start_overlap[:20]}")
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     save_scorer_checkpoint(
@@ -141,11 +214,18 @@ def main() -> None:
         hidden_dim=args.hidden_dim,
         metadata={
             "labels": str(Path(args.labels).resolve()),
+            "labels_sha256": sha256_path(args.labels),
+            "pairs": str(Path(args.pairs).resolve()) if args.pairs else None,
+            "pairs_sha256": sha256_path(args.pairs) if args.pairs else None,
             "num_pairs": len(rows),
             "num_train_pairs": len(train_indices),
             "num_val_pairs": len(val_indices),
             "train_accuracy": train_accuracy,
             "val_accuracy": val_accuracy,
+            "train_balanced_accuracy": train_balanced_accuracy,
+            "val_balanced_accuracy": val_balanced_accuracy,
+            "pair_swap_consistency": pair_swap_consistency,
+            "train_val_start_overlap": 0,
         },
     )
     print(
@@ -157,6 +237,10 @@ def main() -> None:
                 "final_loss": final_loss,
                 "train_accuracy": train_accuracy,
                 "val_accuracy": val_accuracy,
+                "train_balanced_accuracy": train_balanced_accuracy,
+                "val_balanced_accuracy": val_balanced_accuracy,
+                "pair_swap_consistency": pair_swap_consistency,
+                "train_val_start_overlap": 0,
             },
             indent=2,
         )

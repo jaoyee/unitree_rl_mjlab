@@ -19,6 +19,11 @@ SEED="${SEED:-300}"
 DEVICE="${DEVICE:-cuda:0}"
 NUM_IMAGINATION_ENVS="${NUM_IMAGINATION_ENVS:-1024}"
 NUM_ENV_STEPS="${NUM_ENV_STEPS:-50000000}"
+TRACE_REPLAY_PATH="${TRACE_REPLAY_PATH:-}"
+TRACE_REPLAY_RATIO="${TRACE_REPLAY_RATIO:-0.10}"
+POLICY_RESUME_PATH="${POLICY_RESUME_PATH:-}"
+SAVE_REPLAY_BUFFER="${SAVE_REPLAY_BUFFER:-false}"
+LOAD_REWARD_NORMALIZER="${LOAD_REWARD_NORMALIZER:-auto}"
 LIN_VEL_X_RANGE="${LIN_VEL_X_RANGE:--0.5 0.5}"
 LIN_VEL_Y_RANGE="${LIN_VEL_Y_RANGE:--0.25 0.25}"
 ANG_VEL_Z_RANGE="${ANG_VEL_Z_RANGE:--0.5 0.5}"
@@ -72,15 +77,56 @@ if [[ -e "${OUTPUT_DIR}" && -n "$(find "${OUTPUT_DIR}" -mindepth 1 -maxdepth 1 -
 fi
 mkdir -p "${STAGE_DIR}" "${OUTPUT_DIR}"
 
+TRACE_OVERRIDES=()
+if [[ -n "${TRACE_REPLAY_PATH}" ]]; then
+  if [[ ! -f "${TRACE_REPLAY_PATH}" ]]; then
+    echo "Missing TRACE replay artifact: ${TRACE_REPLAY_PATH}" >&2
+    exit 1
+  fi
+  TRACE_REPLAY_PATH="$(realpath "${TRACE_REPLAY_PATH}")"
+  TRACE_OVERRIDES+=(
+    --overrides "trace.enabled=true"
+    --overrides "trace.replay_path=${TRACE_REPLAY_PATH}"
+    --overrides "trace.replay_ratio=${TRACE_REPLAY_RATIO}"
+  )
+fi
+
+POLICY_RESUME_ARGS=()
+if [[ -n "${POLICY_RESUME_PATH}" ]]; then
+  if [[ ! -f "${POLICY_RESUME_PATH}/actor.pt" || ! -f "${POLICY_RESUME_PATH}/agent_state.pt" ]]; then
+    echo "Incomplete policy resume checkpoint: ${POLICY_RESUME_PATH}" >&2
+    exit 1
+  fi
+  POLICY_RESUME_PATH="$(realpath "${POLICY_RESUME_PATH}")"
+  if [[ "${LOAD_REWARD_NORMALIZER}" == auto ]]; then
+    LOAD_REWARD_NORMALIZER=true
+  fi
+  if [[ "${LOAD_REWARD_NORMALIZER}" == true && ! -f "${POLICY_RESUME_PATH}/reward_normalizer.pt" ]]; then
+    echo "Strict continuation requires reward_normalizer.pt: ${POLICY_RESUME_PATH}" >&2
+    exit 1
+  fi
+  POLICY_RESUME_ARGS+=(--policy_resume_path "${POLICY_RESUME_PATH}")
+elif [[ "${LOAD_REWARD_NORMALIZER}" == auto ]]; then
+  LOAD_REWARD_NORMALIZER=false
+fi
+
+case "${SAVE_REPLAY_BUFFER}" in true|false) ;; *) echo "SAVE_REPLAY_BUFFER must be true or false" >&2; exit 1 ;; esac
+case "${LOAD_REWARD_NORMALIZER}" in true|false) ;; *) echo "LOAD_REWARD_NORMALIZER must be true, false, or auto" >&2; exit 1 ;; esac
+SAVE_REPLAY_ARGS=(--no-save_replay_buffer)
+[[ "${SAVE_REPLAY_BUFFER}" == true ]] && SAVE_REPLAY_ARGS=(--save_replay_buffer)
+
 "${PYTHON_BIN}" scripts/reinforcement_learning/rwm_flashsac/train_flashsac_world_model_go2_proprioceptive.py \
   --config_path scripts/reinforcement_learning/rwm_flashsac/configs/go2_flashsac_rwm_proprioceptive.yaml \
   --model_resume_path "${MODEL_PATH}" \
+  "${POLICY_RESUME_ARGS[@]}" \
   --dataset_path "${DATASET_PATH}" \
   --num_imagination_envs "${NUM_IMAGINATION_ENVS}" \
   --num_env_steps "${NUM_ENV_STEPS}" \
   --device "${DEVICE}" \
   --save_path "${OUTPUT_DIR}" \
+  "${SAVE_REPLAY_ARGS[@]}" \
   --overrides "seed=${SEED}" \
+  --overrides "agent.load_reward_normalizer=${LOAD_REWARD_NORMALIZER}" \
   --overrides "world_model.policy_action_mask_indices=[]" \
   --overrides "world_model.world_model_action_mask_indices=[]" \
   --overrides "world_model.policy_observation_mask_indices=[]" \
@@ -102,7 +148,8 @@ mkdir -p "${STAGE_DIR}" "${OUTPUT_DIR}"
   --overrides "world_model.interface_obs_joint_pos_bias_min=0.0" \
   --overrides "world_model.interface_obs_joint_pos_bias_max=0.0" \
   --overrides "world_model.interface_obs_noise_std=0.0" \
-  --overrides "world_model.interface_obs_bias_std=0.0"
+  --overrides "world_model.interface_obs_bias_std=0.0" \
+  "${TRACE_OVERRIDES[@]}"
 
 mapfile -t CHECKPOINTS < <(
   find "${OUTPUT_DIR}" -mindepth 1 -maxdepth 1 -type d -name 'step*' -print \
@@ -130,7 +177,8 @@ printf '%s\n' "${ARTIFACT_SHA256}" > "${STAGE_DIR}/artifact_sha256.txt"
 
 "${PYTHON_BIN}" - "${STAGE_DIR}/summary.json" "${ARTIFACT_PATH}" "${ARTIFACT_SHA256}" \
   "$(realpath "${MODEL_PATH}")" "${MODEL_SHA256}" "$(realpath "${DATASET_PATH}")" "${DATASET_SHA256}" \
-  "${P_ID}" "${ACTION_NOISE_STD}" "${OBS_PROFILE}" "${OBS_SCALE}" "${SEED}" "${NUM_ENV_STEPS}" <<'PY'
+  "${P_ID}" "${ACTION_NOISE_STD}" "${OBS_PROFILE}" "${OBS_SCALE}" "${SEED}" "${NUM_ENV_STEPS}" \
+  "${TRACE_REPLAY_PATH}" "${TRACE_REPLAY_RATIO}" "${POLICY_RESUME_PATH}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -138,6 +186,7 @@ from pathlib import Path
 (
     output, artifact, digest, model, model_digest, dataset, dataset_digest,
     p_id, action_noise, obs_profile, obs_scale, seed, env_steps,
+    trace_replay_path, trace_replay_ratio, policy_resume_path,
 ) = sys.argv[1:]
 Path(output).write_text(json.dumps({
     "status": "completed",
@@ -150,6 +199,12 @@ Path(output).write_text(json.dumps({
     "p_id": p_id,
     "seed": int(seed),
     "num_env_steps": int(env_steps),
+    "policy_resume_path": policy_resume_path or None,
+    "trace": {
+        "enabled": bool(trace_replay_path),
+        "replay_path": trace_replay_path or None,
+        "replay_ratio": float(trace_replay_ratio) if trace_replay_path else 0.0,
+    },
     "interface": {
         "action_noise_std": float(action_noise),
         "action_bias_std": 0.0,

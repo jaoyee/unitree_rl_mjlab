@@ -198,6 +198,13 @@ def main() -> None:
         trace_ratio = float(OmegaConf.select(cfg, "trace.replay_ratio", default=0.1))
         trace_seed = int(OmegaConf.select(cfg, "trace.seed", default=int(cfg.seed)))
         trace_sampler = TraceReplaySampler(resolve_repo_path(str(trace_path_value)), seed=trace_seed)
+        allow_legacy_trace = bool(OmegaConf.select(cfg, "trace.allow_legacy", default=False))
+        protocol = trace_sampler.metadata.get("trace_protocol_version")
+        if protocol != "go2_trace_v5_controlled" and not allow_legacy_trace:
+            raise ValueError(
+                "Formal TRACE training requires a controlled V5 replay artifact; "
+                f"got protocol={protocol!r}. Set trace.allow_legacy=true only for diagnostic reproduction."
+            )
         replay_obs_dim = int(trace_sampler.data["observation"].shape[-1])
         env_obs_dim = int(env.single_observation_space.shape[-1])
         if replay_obs_dim != env_obs_dim:

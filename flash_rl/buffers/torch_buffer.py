@@ -197,13 +197,21 @@ class TorchUniformBuffer(BaseBuffer):
         """
         os.makedirs(os.path.dirname(path), exist_ok=True)
         n = self._num_in_buffer
+        # A slice keeps the full preallocated backing storage.  Serializing
+        # that view writes the entire multi-gigabyte replay capacity even when
+        # only a small prefix is valid.  Clone compact CPU tensors so strict
+        # continuation checkpoints scale with the number of valid rows.
+        def compact(value: torch.Tensor) -> torch.Tensor:
+            return value[:n].detach().cpu().clone()
+
         dataset: dict[str, Any] = {
-            "observation": self._observations[:n],
-            "action": self._actions[:n],
-            "reward": self._rewards[:n],
-            "terminated": self._terminateds[:n],
-            "truncated": self._truncateds[:n],
-            "next_observation": self._next_observations[:n],
+            "format_version": "torch_uniform_buffer_compact_v1",
+            "observation": compact(self._observations),
+            "action": compact(self._actions),
+            "reward": compact(self._rewards),
+            "terminated": compact(self._terminateds),
+            "truncated": compact(self._truncateds),
+            "next_observation": compact(self._next_observations),
             "num_in_buffer": self._num_in_buffer,
             "current_idx": self._current_idx,
         }
@@ -216,7 +224,13 @@ class TorchUniformBuffer(BaseBuffer):
             path (str): The full file path (e.g. "checkpoints/replay_buffer.pt").
         """
         dataset = torch.load(path, map_location=self._device)
-        n = dataset["num_in_buffer"]
+        n = int(dataset["num_in_buffer"])
+        if n < 0 or n > self._max_length:
+            raise ValueError(f"Replay checkpoint row count {n} exceeds capacity {self._max_length}.")
+        required = ("observation", "action", "reward", "terminated", "truncated", "next_observation")
+        bad = {key: int(dataset[key].shape[0]) for key in required if int(dataset[key].shape[0]) != n}
+        if bad:
+            raise ValueError(f"Replay checkpoint fields do not match num_in_buffer={n}: {bad}.")
 
         self._observations[:n] = dataset["observation"]
         self._next_observations[:n] = dataset["next_observation"]

@@ -20,6 +20,7 @@ BATCH_SIZE="${BATCH_SIZE:-1024}"
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-256}"
 NUM_EVAL_SEQUENCES="${NUM_EVAL_SEQUENCES:-4096}"
 STATE_LOSS_IGNORED_INDICES="${STATE_LOSS_IGNORED_INDICES:-}"
+SKIP_RWM_EVAL="${SKIP_RWM_EVAL:-0}"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
   echo "Python environment not found: ${PYTHON_BIN}" >&2
@@ -67,14 +68,16 @@ if [[ ! -f "${MODEL_PATH}" || ! -f "${RUN_DIR}/latest.pt" ]]; then
   exit 1
 fi
 
-"${PYTHON_BIN}" scripts/reinforcement_learning/rwm_dataset/eval_world_model_go2_proprioceptive.py \
-  --dataset_path "${DATASET_PATH}" \
-  --model_path "${MODEL_PATH}" \
-  --num_eval_sequences "${NUM_EVAL_SEQUENCES}" \
-  --rollout_horizon 20 \
-  --device "${DEVICE}" \
-  --seed "$((SEED + 1))" \
-  > "${STAGE_DIR}/rwm_eval.log" 2>&1
+if [[ "${SKIP_RWM_EVAL}" != "1" ]]; then
+  "${PYTHON_BIN}" scripts/reinforcement_learning/rwm_dataset/eval_world_model_go2_proprioceptive.py \
+    --dataset_path "${DATASET_PATH}" \
+    --model_path "${MODEL_PATH}" \
+    --num_eval_sequences "${NUM_EVAL_SEQUENCES}" \
+    --rollout_horizon 20 \
+    --device "${DEVICE}" \
+    --seed "$((SEED + 1))" \
+    > "${STAGE_DIR}/rwm_eval.log" 2>&1
+fi
 
 MODEL_PATH="$(realpath "${MODEL_PATH}")"
 MODEL_SHA256="$(sha256sum "${MODEL_PATH}" | awk '{print $1}')"
@@ -102,7 +105,10 @@ Path(output).write_text(json.dumps({
     "state_loss_ignored_indices": ignored,
     "masked_joint_names": [],
     "action_mask_indices": [],
-    "evaluation_log": str(Path(output).parent / "rwm_eval.log"),
+    "evaluation_log": (
+        str(Path(output).parent / "rwm_eval.log")
+        if (Path(output).parent / "rwm_eval.log").exists() else None
+    ),
 }, indent=2, sort_keys=True), encoding="utf-8")
 PY
 

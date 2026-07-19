@@ -11,6 +11,54 @@ with best-in-class [MuJoCo](https://github.com/google-deepmind/mujoco_warp)
 physics to provide lightweight, modular abstractions for RL robotics research
 and sim-to-real deployment.
 
+## Go2 Corrected TRACE V7
+
+The `zkq/go2-rwm-sim2real` branch contains the current corrected Go2 V7
+workflow for comparing an RWM baseline with TRACE under aligned simulated and
+real-world gaps. V5/V6 experiment outputs are retained only for audit and are
+not final results.
+
+### Research workflow
+
+```text
+healthy expert policy
+        |
+        +--> condition-aligned simulation collection --> sim 25K dataset
+        |
+        +--> physical-robot collection -------------> real 25K dataset
+                                                        |
+                              condition-specific frozen RWM
+                                                        |
+                 +----------------------+---------------+
+                 |                                      |
+          RWM baseline policy                     TRACE policy
+                                                        |
+                       imperfect-simulator candidates + scorer
+                                                        |
+                         selected replay + RWM replay buffer
+                                                        |
+                         periodic final-policy updates
+```
+
+The formal matrix contains two data sides (`sim`, `real`), five aligned gap
+conditions (`g0`, `rr05`, `rr03`, `p5`, `p75`), and three methods per
+condition (RWM baseline, TRACE-r10, TRACE-r25). Every condition uses its own
+validated 25K dataset and frozen RWM.
+
+TRACE V7 uses `T=2`, `H=100`, eight refresh cycles, 5M policy-environment
+steps per refresh, scorer top-25% selection, and continuous RWM replay across
+refreshes. The r10/r25 branches inject 10%/25% selected simulator replay. No
+fixed failure quota is imposed; naturally terminated trajectories remain
+eligible for scorer selection.
+
+For the main real-data comparison, `real/g0` must use the new go2sun
+recollection. The legacy go2-g0 dataset and policies are cross-robot audit
+artifacts and must not enter the main five-gap result table.
+
+Start with the complete protocol, input manifest, launch commands, evaluation
+definitions, and completion checks in
+[GO2_TRACE_V7_WORKFLOW.md](scripts/reinforcement_learning/go2_sim_gap_aligned/GO2_TRACE_V7_WORKFLOW.md).
+
 <div align="center">
 
 | <div align="center">  MuJoCo </div>                                                                                                                                           | <div align="center"> Physical </div>                                                                                                                                               |

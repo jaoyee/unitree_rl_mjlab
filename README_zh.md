@@ -10,6 +10,50 @@ Mjlab 结合了 [Isaac Lab](https://github.com/isaac-sim/IsaacLab) 的成熟高�
 [MuJoCo](https://github.com/google-deepmind/mujoco_warp) 的高精度物理引擎，
 为强化学习机器人研究与 Sim-to-Real（仿真到实机） 部署提供了一个轻量化、模块化的框架。
 
+## Go2 Corrected TRACE V7
+
+`zkq/go2-rwm-sim2real` 分支是当前 Go2 实验的正式 V7 版本，用于在对齐的
+仿真与实机 gap 条件下比较 RWM baseline 和 TRACE。V5/V6 的实验目录与结果
+仅用于历史审计，不作为正式结果。
+
+### 研究路线
+
+```text
+健康 expert policy
+        |
+        +--> 相同 gap 仿真环境采集 --> sim 25K dataset
+        |
+        +--> 真机部署采集 ----------> real 25K dataset
+                                         |
+                              每个条件独立的冻结 RWM
+                                         |
+                 +-----------------------+----------------+
+                 |                                        |
+           RWM baseline policy                       TRACE policy
+                                                          |
+                            imperfect simulator 候选 + scorer
+                                                          |
+                              筛选 replay + RWM replay buffer
+                                                          |
+                                  周期性更新最终 policy
+```
+
+正式实验矩阵包含两类数据来源（`sim`、`real`）、五个对齐 gap
+（`g0`、`rr05`、`rr03`、`p5`、`p75`），以及每个条件下的三种方法
+（RWM baseline、TRACE-r10、TRACE-r25）。每个条件使用独立验证过的 25K
+数据集和独立冻结 RWM。
+
+TRACE V7 的正式参数为 `T=2`、`H=100`、8 次 refresh、每次 5M
+policy-environment steps、scorer 选择 top 25%，并保持 RWM replay buffer 在
+refresh 之间连续。r10/r25 分别注入 10%/25% 的 simulator replay。不强制固定
+失败样本比例，但自然 termination 仍可参与 scorer 的正常筛选。
+
+正式 real 侧的 `g0` 必须使用新采集的 go2sun-g0。旧 go2-g0 数据和对应策略
+只用于跨机器人个体差异审计，不能进入正式五个 gap 的主结果表。
+
+完整协议、数据 manifest、训练入口、评测定义和完成检查请阅读
+[GO2_TRACE_V7_WORKFLOW.md](scripts/reinforcement_learning/go2_sim_gap_aligned/GO2_TRACE_V7_WORKFLOW.md)。
+
 <div align="center">
 
 | <div align="center">  MuJoCo </div>                                                                                                                                           | <div align="center"> Physical </div>                                                                                                                                               |

@@ -345,7 +345,10 @@ def main() -> None:
                 agent,
                 save_root / f"step{interaction_step}",
                 cfg,
-                save_replay=bool(cfg.save_replay_buffer),
+                # Replay continuity is only needed at the final resumable
+                # checkpoint.  Serializing the 10M-row buffer at every
+                # diagnostic checkpoint wastes hundreds of GiB per branch.
+                save_replay=False,
             )
 
     _save_checkpoint(

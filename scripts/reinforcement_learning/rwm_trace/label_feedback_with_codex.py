@@ -23,6 +23,18 @@ def parse_args():
     parser.add_argument("--max-pairs", type=int, default=None)
     parser.add_argument("--confidence-threshold", type=float, default=0.70)
     parser.add_argument("--max-retries", type=int, default=2)
+    parser.add_argument(
+        "--minimum-filtered-labels",
+        type=int,
+        default=10,
+        help="Retry only the weakest batches until this many unique labels pass the confidence gate.",
+    )
+    parser.add_argument(
+        "--max-low-confidence-relabels",
+        type=int,
+        default=7,
+        help="Maximum additional low-confidence batch queries per output directory.",
+    )
     parser.add_argument("--timeout-sec", type=float, default=240.0)
     parser.add_argument("--lock-path", type=str, default=None)
     parser.add_argument("--codex-model", type=str, default=None)
@@ -131,12 +143,35 @@ def parse_response(response_path: Path) -> dict:
     return json.loads(text)
 
 
+def _label_rank(label: dict) -> tuple[int, float]:
+    complete = int(
+        label.get("feedback") in {"i", "j"}
+        and bool(str(label.get("reason", "")).strip())
+    )
+    try:
+        confidence = float(label.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    return complete, confidence
+
+
 def merge_labels(prompt_rows: List[dict], label_rows: List[dict], confidence_threshold: float):
     prompt_by_id: Dict[str, dict] = {row["pair_id"]: row for row in prompt_rows}
-    raw = []
-    filtered = []
+    best_by_id: Dict[str, dict] = {}
     for label in label_rows:
         pair_id = str(label.get("pair_id", ""))
+        if pair_id not in prompt_by_id:
+            continue
+        previous = best_by_id.get(pair_id)
+        if previous is None or _label_rank(label) > _label_rank(previous):
+            best_by_id[pair_id] = label
+    raw = []
+    filtered = []
+    for prompt_row in prompt_rows:
+        pair_id = str(prompt_row["pair_id"])
+        label = best_by_id.get(pair_id)
+        if label is None:
+            continue
         prompt = prompt_by_id.get(pair_id)
         merged = {**label}
         if prompt:
@@ -185,12 +220,23 @@ def merge_labels(prompt_rows: List[dict], label_rows: List[dict], confidence_thr
     return raw, filtered
 
 
+def response_labels(response_path: Path) -> List[dict]:
+    try:
+        parsed = parse_response(response_path)
+    except Exception:
+        return []
+    labels = parsed.get("labels", [])
+    return labels if isinstance(labels, list) else []
+
+
 def main() -> None:
     args = parse_args()
     out = Path(args.output_dir)
     raw_dir = out / "raw_batches"
+    relabel_dir = raw_dir / "low_confidence_relabels"
     batch_prompt_dir = out / "batch_prompts"
     raw_dir.mkdir(parents=True, exist_ok=True)
+    relabel_dir.mkdir(parents=True, exist_ok=True)
     batch_prompt_dir.mkdir(parents=True, exist_ok=True)
 
     prompts = list(iter_jsonl(args.prompts))
@@ -232,10 +278,68 @@ def main() -> None:
             labels = parsed.get("labels", [])
             all_labels.extend(labels)
 
+    # Existing low-confidence relabels are additive.  For every pair,
+    # merge_labels keeps the complete judgment with the highest confidence,
+    # so a retry can never discard a previously accepted label.
+    for response_path in sorted(relabel_dir.glob("relabel_*_batch_*_response.json")):
+        all_labels.extend(response_labels(response_path))
+
+    raw, filtered = merge_labels(prompts, all_labels, args.confidence_threshold)
+    minimum_filtered = min(max(int(args.minimum_filtered_labels), 0), len(prompts))
+    existing_attempts = len(list(relabel_dir.glob("relabel_*_batch_*_stdout.jsonl")))
+    while (
+        len(filtered) < minimum_filtered
+        and existing_attempts < max(int(args.max_low_confidence_relabels), 0)
+    ):
+        filtered_ids = {str(row.get("pair_id", "")) for row in filtered}
+        attempts_by_batch: Dict[int, int] = {}
+        for stdout_path in relabel_dir.glob("relabel_*_batch_*_stdout.jsonl"):
+            try:
+                batch_idx = int(stdout_path.name.split("_batch_", 1)[1].split("_", 1)[0])
+            except (IndexError, ValueError):
+                continue
+            attempts_by_batch[batch_idx] = attempts_by_batch.get(batch_idx, 0) + 1
+        batch_candidates = []
+        for start in range(0, len(prompts), args.batch_size):
+            batch_idx = start // args.batch_size
+            batch = prompts[start: start + args.batch_size]
+            accepted = sum(str(row["pair_id"]) in filtered_ids for row in batch)
+            missing = len(batch) - accepted
+            batch_candidates.append(
+                (attempts_by_batch.get(batch_idx, 0), -missing, batch_idx, batch)
+            )
+        _, _, batch_idx, batch = min(batch_candidates, key=lambda row: row[:3])
+        existing_attempts += 1
+        stem = f"relabel_{existing_attempts:04d}_batch_{batch_idx:04d}"
+        prompt_path = relabel_dir / f"{stem}_prompt.txt"
+        response_path = relabel_dir / f"{stem}_response.json"
+        stdout_path = relabel_dir / f"{stem}_stdout.jsonl"
+        prompt_path.write_text(build_batch_prompt(batch), encoding="utf-8")
+        print(
+            f"Filtered-label gate {len(filtered)}/{minimum_filtered}; "
+            f"relabeling low-confidence batch {batch_idx} "
+            f"({existing_attempts}/{args.max_low_confidence_relabels})"
+        )
+        parsed = None
+        for attempt in range(args.max_retries + 1):
+            if call_codex_with_optional_lock(prompt_path, response_path, stdout_path, args):
+                try:
+                    parsed = parse_response(response_path)
+                    break
+                except Exception as exc:
+                    stdout_path.write_text(
+                        stdout_path.read_text(encoding="utf-8") + f"\nPARSE_ERROR: {exc}\n",
+                        encoding="utf-8",
+                    )
+            if attempt == args.max_retries:
+                failed.append(f"low_confidence_relabel_{existing_attempts}")
+        if parsed is not None:
+            all_labels.extend(parsed.get("labels", []))
+        raw, filtered = merge_labels(prompts, all_labels, args.confidence_threshold)
+
     if failed:
         (out / "failed_batches.txt").write_text("\n".join(str(x) for x in failed), encoding="utf-8")
 
-    raw, filtered = merge_labels(prompts, all_labels, args.confidence_threshold)
     write_jsonl(out / "codex_labels_raw.jsonl", raw)
     write_jsonl(out / "codex_labels_filtered.jsonl", filtered)
     conflict_raw = [row for row in raw if row.get("pair_type") == "conflict_return_vs_motion"]

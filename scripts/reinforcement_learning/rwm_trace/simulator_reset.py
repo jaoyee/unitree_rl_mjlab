@@ -228,6 +228,10 @@ def restore_go2_simulator_snapshot(
     _force_commands(env, command, env_ids)
 
     env.episode_length_buf[env_ids] = 0
+    # Reconstruct derived actuator forces for the held action. Without this,
+    # the first restored 45D state retains force values from the environment
+    # that happened to occupy this simulator slot before the snapshot reset.
+    manager.apply_action()
     env.scene.write_data_to_sim()
     env.sim.forward()
     env.sim.sense()

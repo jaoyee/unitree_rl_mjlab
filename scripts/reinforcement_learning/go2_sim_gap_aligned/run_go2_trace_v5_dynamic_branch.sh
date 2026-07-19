@@ -3,7 +3,7 @@ set -euo pipefail
 
 REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
 : "${SIDE:?Set SIDE=sim or SIDE=real}"
-: "${BRANCH_ID:?Set BRANCH_ID=r10 or BRANCH_ID=r25}"
+: "${BRANCH_ID:?Set a unique branch identifier}"
 : "${RUN_ROOT:?Set a new, empty V5 branch directory}"
 : "${DATASET_PATH:?Set the exact 25K RWM dataset path}"
 : "${MODEL_PATH:?Set the frozen RWM model_5000.pt path}"
@@ -14,7 +14,20 @@ REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
 : "${CUDA_VISIBLE_DEVICES:?Set exactly one physical GPU}"
 
 case "${SIDE}" in sim) RESET_MODE=exact_snapshot ;; real) RESET_MODE=canonical_real_projection ;; *) exit 2 ;; esac
-case "${BRANCH_ID}" in r10) REPLAY_RATIO=0.10 ;; r25) REPLAY_RATIO=0.25 ;; *) exit 2 ;; esac
+if [[ -n "${REPLAY_RATIO_OVERRIDE:-}" ]]; then
+  REPLAY_RATIO="${REPLAY_RATIO_OVERRIDE}"
+else
+  case "${BRANCH_ID}" in r10) REPLAY_RATIO=0.10 ;; r25) REPLAY_RATIO=0.25 ;; *)
+    echo "Set REPLAY_RATIO_OVERRIDE for BRANCH_ID=${BRANCH_ID}" >&2
+    exit 2
+  esac
+fi
+"${REPO}/.venv/bin/python" - "${REPLAY_RATIO}" <<'PY'
+import sys
+value = float(sys.argv[1])
+if not 0.0 < value <= 1.0:
+    raise SystemExit(f"REPLAY_RATIO must be in (0, 1], got {value}")
+PY
 CONDITION="${CONDITION:-}"
 if [[ -n "${CONDITION}" ]]; then
   case "${CONDITION}" in g0|rr05|p5|rr03|p75) ;; *) echo "Bad CONDITION=${CONDITION}" >&2; exit 2 ;; esac
@@ -39,10 +52,14 @@ TRACE_QUERY_BUDGET_INITIAL="${TRACE_QUERY_BUDGET_INITIAL:-200}"
 TRACE_QUERY_BUDGET_MIN="${TRACE_QUERY_BUDGET_MIN:-20}"
 TRACE_QUERY_BUDGET_DECAY="${TRACE_QUERY_BUDGET_DECAY:-0.8}"
 TRACE_QUERY_STOP_CYCLE="${TRACE_QUERY_STOP_CYCLE:-${REFRESH_CYCLES}}"
-TRACE_MIN_FILTERED_LABEL_FRACTION="${TRACE_MIN_FILTERED_LABEL_FRACTION:-0.20}"
+TRACE_MIN_FILTERED_LABEL_FRACTION="${TRACE_MIN_FILTERED_LABEL_FRACTION:-0.15}"
+TRACE_MIN_FILTERED_LABELS="${TRACE_MIN_FILTERED_LABELS:-10}"
 CODEX_LOCK="${CODEX_LOCK:-$(dirname "${RUN_ROOT}")/codex_feedback.lock}"
 STATE_FILE="${RUN_ROOT}/state.txt"
 RUN_LOG="${RUN_ROOT}/run.log"
+POST_REFRESH_HOOK="${POST_REFRESH_HOOK:-}"
+LAST_COMPLETED_CYCLE=0
+STOP_REASON=""
 
 export MUJOCO_GL=egl WANDB_MODE=offline
 export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8 NUMEXPR_NUM_THREADS=8
@@ -126,6 +143,31 @@ for cycle in $(seq 1 "${REFRESH_CYCLES}"); do
   CYCLE_ROOT="${RUN_ROOT}/refresh_$(printf '%02d' "${cycle}")"
   mkdir -p "${CYCLE_ROOT}/candidates" "${CYCLE_ROOT}/summaries" \
     "${CYCLE_ROOT}/feedback" "${CYCLE_ROOT}/replay" "${CYCLE_ROOT}/policy/stage"
+
+  # A completed policy segment is the refresh commit point.  On restart, use
+  # its policy/scorer as the inputs to the next refresh instead of rebuilding
+  # already committed candidates, labels, and replay artifacts.
+  completed_policy_file="${CYCLE_ROOT}/policy/stage/artifact_path.txt"
+  completed_scorer="${CYCLE_ROOT}/feedback/go2_trace_scorer.pt"
+  if [[ -s "${CYCLE_ROOT}/policy/stage/summary.json" \
+        && -s "${completed_policy_file}" \
+        && -s "${completed_scorer}" ]]; then
+    completed_policy="$(<"${completed_policy_file}")"
+    [[ -d "${completed_policy}" ]] || {
+      echo "Completed refresh ${cycle} points to missing policy: ${completed_policy}" >&2
+      exit 2
+    }
+    CURRENT_POLICY="$(realpath "${completed_policy}")"
+    CURRENT_SCORER="$(realpath "${completed_scorer}")"
+    write_state "${cycle}" resume_skip completed
+    "${PY}" scripts/reinforcement_learning/rwm_trace/artifact_manifest.py verify \
+      --manifest "${RUN_ROOT}/input_manifest.json"
+    continue
+  fi
+  [[ -s "${CURRENT_POLICY}/replay_buffer.pt" ]] || {
+    echo "TRACE requires a continuous RWMbuffer; missing ${CURRENT_POLICY}/replay_buffer.pt" >&2
+    exit 2
+  }
   write_state "${cycle}" collect_candidates running
 
   for gap in "${GAPS[@]}"; do
@@ -191,15 +233,15 @@ for cycle in $(seq 1 "${REFRESH_CYCLES}"); do
   LABEL_DIR="${CYCLE_ROOT}/feedback/labels"
   FILTERED="${LABEL_DIR}/codex_labels_filtered.jsonl"
   minimum_labels="$("${PY}" -c \
-    'import math, sys; print(max(20, int(math.ceil(int(sys.argv[1]) * float(sys.argv[2])))))' \
-    "${query_budget}" "${TRACE_MIN_FILTERED_LABEL_FRACTION}")"
-  (( minimum_labels >= 20 )) || minimum_labels=20
+    'import math, sys; print(max(int(sys.argv[3]), int(math.ceil(int(sys.argv[1]) * float(sys.argv[2])))))' \
+    "${query_budget}" "${TRACE_MIN_FILTERED_LABEL_FRACTION}" "${TRACE_MIN_FILTERED_LABELS}")"
   while [[ ! -s "${FILTERED}" ]] || (( $(grep -cve '^[[:space:]]*$' "${FILTERED}" || true) < minimum_labels )); do
     write_state "${cycle}" label_feedback waiting
     "${PY}" scripts/reinforcement_learning/rwm_trace/label_feedback_with_codex.py \
       --prompts "${PAIRS}" --output-dir "${LABEL_DIR}" \
       --schema scripts/reinforcement_learning/rwm_trace/feedback_label_batch.schema.json \
       --repo-root "${REPO}" --batch-size 20 --confidence-threshold 0.70 \
+      --minimum-filtered-labels "${minimum_labels}" --max-low-confidence-relabels 7 \
       --max-retries 2 --timeout-sec 300 --lock-path "${CODEX_LOCK}" \
       --codex-service-tier default 2>&1 | tee -a "${RUN_LOG}" || true
     [[ -s "${FILTERED}" ]] && count=$(grep -cve '^[[:space:]]*$' "${FILTERED}" || true) || count=0
@@ -234,7 +276,7 @@ PY
       --candidate_dataset "${CYCLE_ROOT}/candidates/${gap}.pt" --output "${replay}" \
       --scorer_checkpoint "${CURRENT_SCORER}" --selection scorer --select_ratio "${SELECT_RATIO}" \
       --trajectory_length "${TRACE_H}" --trajectory_stride "${TRACE_H}" \
-      --include_terminal_prefixes --minimum_terminal_length 20 --failure_transition_ratio 0.20 \
+      --include_terminal_prefixes --minimum_terminal_length 20 --failure_transition_ratio 0.0 \
       --terminal_penalty=-10 --failure_backprop_steps 40 --failure_backprop_penalty 2 \
       --action_saturation_penalty_scale 10 --action_delta_penalty_scale 0.10 \
       --n_step 3 --gamma 0.99 --reward_source rwm_aligned --seed 42 \
@@ -246,6 +288,7 @@ PY
     "${merge_args[@]}" --output "${MERGED_REPLAY}" 2>&1 | tee -a "${RUN_LOG}"
 
   write_state "${cycle}" train_policy_segment running
+  PREVIOUS_POLICY="$(realpath "${CURRENT_POLICY}")"
   if [[ ! -s "${CYCLE_ROOT}/policy/stage/summary.json" ]]; then
     STAGE_DIR="${CYCLE_ROOT}/policy/stage" OUTPUT_DIR="${CYCLE_ROOT}/policy/run" \
       DATASET_PATH="${DATASET_PATH}" MODEL_PATH="${MODEL_PATH}" P_ID=P0 DEVICE=cuda:0 \
@@ -257,11 +300,42 @@ PY
       2>&1 | tee -a "${RUN_LOG}"
   fi
   CURRENT_POLICY="$(<"${CYCLE_ROOT}/policy/stage/artifact_path.txt")"
+  [[ -s "${CURRENT_POLICY}/replay_buffer.pt" ]] || {
+    echo "Policy segment did not save its final RWMbuffer: ${CURRENT_POLICY}" >&2
+    exit 2
+  }
   "${PY}" scripts/reinforcement_learning/rwm_trace/artifact_manifest.py verify \
     --manifest "${RUN_ROOT}/input_manifest.json"
+  LAST_COMPLETED_CYCLE="${cycle}"
+  if [[ -n "${POST_REFRESH_HOOK}" ]]; then
+    hook_status=0
+    "${POST_REFRESH_HOOK}" "${cycle}" "${CURRENT_POLICY}" "${RUN_ROOT}" || hook_status=$?
+    if [[ "${hook_status}" -eq 20 ]]; then
+      STOP_REASON="pilot_early_stop_hook"
+      printf 'time=%s\ncycle=%s\nreason=%s\npolicy=%s\n' \
+        "$(date --iso-8601=seconds)" "${cycle}" "${STOP_REASON}" "${CURRENT_POLICY}" \
+        > "${RUN_ROOT}/stopped_early.txt"
+      write_state "${cycle}" pilot_early_stop stopped
+      break
+    elif [[ "${hook_status}" -ne 0 ]]; then
+      echo "Post-refresh hook failed at cycle ${cycle} with status ${hook_status}" >&2
+      exit "${hook_status}"
+    fi
+  fi
+  # Once the new policy+buffer is committed, retain only the latest branch
+  # buffer.  Never remove the shared common-warmup buffer used to start r10
+  # and r25 independently.
+  case "${PREVIOUS_POLICY}" in
+    "${RUN_ROOT}"/refresh_*/policy/run/step4882)
+      [[ "${PREVIOUS_POLICY}" == "${CURRENT_POLICY}" ]] || \
+        rm -f -- "${PREVIOUS_POLICY}/replay_buffer.pt"
+      ;;
+  esac
 done
 
-printf 'side=%s\ncondition=%s\nbranch=%s\nfinal_policy=%s\ntemperature=%s\nhorizon=%s\ncycles=%s\n' \
-  "${SIDE}" "${CONDITION:-pooled}" "${BRANCH_ID}" "${CURRENT_POLICY}" "${TRACE_T}" "${TRACE_H}" \
-  "${REFRESH_CYCLES}" > "${RUN_ROOT}/completed.txt"
-write_state "${REFRESH_CYCLES}" done completed
+if [[ -z "${STOP_REASON}" ]]; then
+  printf 'side=%s\ncondition=%s\nbranch=%s\nfinal_policy=%s\ntemperature=%s\nhorizon=%s\ncycles=%s\nreplay_ratio=%s\nselect_ratio=%s\n' \
+    "${SIDE}" "${CONDITION:-pooled}" "${BRANCH_ID}" "${CURRENT_POLICY}" "${TRACE_T}" "${TRACE_H}" \
+    "${REFRESH_CYCLES}" "${REPLAY_RATIO}" "${SELECT_RATIO}" > "${RUN_ROOT}/completed.txt"
+  write_state "${REFRESH_CYCLES}" done completed
+fi

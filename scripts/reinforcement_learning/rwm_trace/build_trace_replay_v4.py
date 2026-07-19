@@ -326,13 +326,25 @@ def _select_indices(
         ],
         dtype=np.int64,
     )
-    if getattr(args, "failure_transition_ratio", None) is None:
+    transition_target = getattr(args, "failure_transition_ratio", None)
+    trajectory_minimum = float(args.failure_trajectory_ratio)
+    quota_disabled = (
+        (transition_target is None and trajectory_minimum <= 0.0)
+        or (transition_target is not None and float(transition_target) <= 0.0)
+    )
+    ranked = eligible_indices[np.argsort(-(scores[eligible_indices] + jitter[eligible_indices]))]
+    if quota_disabled:
+        # A zero target disables forced failure composition. Natural terminal
+        # trajectories remain eligible and are selected solely by the chosen
+        # scorer/random ranking.
+        return ranked[:selected_count].astype(np.int64), scores
+    if transition_target is None:
         failure_count = min(
             len(failure_indices),
-            int(math.ceil(selected_count * float(args.failure_trajectory_ratio))),
+            int(math.ceil(selected_count * trajectory_minimum)),
         )
     else:
-        target = float(args.failure_transition_ratio)
+        target = float(transition_target)
         n_step = int(getattr(args, "n_step", 3))
         success_indices = [int(index) for index in eligible_indices if int(index) not in set(map(int, failure_indices))]
 
@@ -364,7 +376,6 @@ def _select_indices(
     # selected for the quota allowed additional terminal trajectories to leak
     # into the nominal-success portion of the replay.
     all_failure_set = set(map(int, failure_indices))
-    ranked = eligible_indices[np.argsort(-(scores[eligible_indices] + jitter[eligible_indices]))]
     selected_successes = [int(index) for index in ranked if int(index) not in all_failure_set][
         : selected_count - failure_count
     ]
@@ -616,6 +627,17 @@ def main() -> None:
             "failure_trajectory_ratio": float(args.failure_trajectory_ratio),
             "failure_transition_ratio_target": (
                 None if args.failure_transition_ratio is None else float(args.failure_transition_ratio)
+            ),
+            "failure_quota_mode": (
+                "disabled_natural"
+                if (
+                    (args.failure_transition_ratio is None and float(args.failure_trajectory_ratio) <= 0.0)
+                    or (
+                        args.failure_transition_ratio is not None
+                        and float(args.failure_transition_ratio) <= 0.0
+                    )
+                )
+                else "forced_target"
             ),
             "terminal_penalty": float(args.terminal_penalty),
             "failure_backprop_steps": int(args.failure_backprop_steps),

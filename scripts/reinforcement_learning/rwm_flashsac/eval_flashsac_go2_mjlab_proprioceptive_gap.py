@@ -48,11 +48,19 @@ from scripts.reinforcement_learning.rwm_flashsac.utils import (
 from scripts.reinforcement_learning.rwm_flashsac.world_model_env_proprioceptive import (
     CRITIC_OBS_DIM_FULL_RWM,
 )
+from scripts.reinforcement_learning.rwm_flashsac.dynamics_loader import (
+    load_any_go2_dynamics_checkpoint,
+)
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument("--checkpoint_path", required=True)
+    parser.add_argument(
+        "--model_path",
+        default=None,
+        help="Optional frozen RWM checkpoint used to score epistemic uncertainty on true-env transitions.",
+    )
     parser.add_argument("--config_path", default=None)
     parser.add_argument("--task", default="Unitree-Go2-Flat-RWM-Pretrain-Ens")
     parser.add_argument("--device", default=None)
@@ -236,6 +244,25 @@ def _mean(values: list[float], fallback: float = 0.0) -> float:
     return float(np.mean(values)) if values else fallback
 
 
+def _state_from_full_obs_np(observations: np.ndarray, actuator_force: np.ndarray) -> np.ndarray:
+    """Build the 45D RWM state from policy observations plus privileged force."""
+
+    return np.concatenate(
+        (observations[:, 0:9], observations[:, 12:36], actuator_force),
+        axis=-1,
+    ).astype(np.float32, copy=False)
+
+
+def _actuator_force_np(env: Any) -> np.ndarray:
+    return (
+        env.scene["robot"]
+        .data.actuator_force.detach()
+        .cpu()
+        .numpy()
+        .astype(np.float32, copy=False)
+    )
+
+
 def main() -> None:
     configure_low_thread_env()
     os.environ.setdefault("MUJOCO_GL", "egl")
@@ -333,26 +360,65 @@ def main() -> None:
     agent = create_go2_flashsac_proprioceptive_agent(obs_space, action_space, agent_cfg)
     agent.load(str(checkpoint_path))
 
+    dynamics = None
+    history_horizon = 0
+    if args.model_path:
+        dynamics, _ = load_any_go2_dynamics_checkpoint(
+            resolve_repo_path(args.model_path),
+            device=device,
+        )
+        dynamics.eval()
+        history_horizon = int(dynamics.cfg.history_horizon)
+
     obs_dict, _ = env.reset()
     _force_fixed_command(env, initial_command)
     full_observations = _apply_command_to_full_obs(_actor_obs(obs_dict), initial_command)
 
     ep_returns = np.zeros(args.num_envs, dtype=np.float64)
+    rollout_returns = np.zeros(args.num_envs, dtype=np.float64)
     ep_lengths = np.zeros(args.num_envs, dtype=np.int64)
+    reset_counts = np.zeros(args.num_envs, dtype=np.int64)
+    termination_counts = np.zeros(args.num_envs, dtype=np.int64)
+    alive_reward_sums = np.zeros(args.num_envs, dtype=np.float64)
+    alive_step_counts = np.zeros(args.num_envs, dtype=np.int64)
     completed_returns: list[float] = []
     completed_lengths: list[float] = []
     terminated_count = 0
     timeout_count = 0
+    first_failure_steps = np.full(args.num_envs, -1, dtype=np.int64)
     logged_metrics: dict[str, list[float]] = defaultdict(list)
     base_lin_vel_samples: list[np.ndarray] = []
     base_ang_vel_samples: list[np.ndarray] = []
     command_samples: list[np.ndarray] = []
     action_abs_samples: list[float] = []
+    action_delta_abs_samples: list[float] = []
+    action_saturation_samples: list[float] = []
+    step_vel_error_xy: list[float] = []
+    step_vel_error_yaw: list[float] = []
+    previous_actions_np: np.ndarray | None = None
+    roll_abs_samples: list[float] = []
+    pitch_abs_samples: list[float] = []
+    tilt_samples: list[float] = []
+    epistemic_samples: list[float] = []
+    epistemic_valid_rows = 0
+    epistemic_total_rows = 0
     estimated_base_lin_vel_samples: list[np.ndarray] = []
     estimated_base_lin_vel_truth_samples: list[np.ndarray] = []
     estimator_confidence_samples: list[np.ndarray] = []
     estimator_per_foot_samples: list[np.ndarray] = []
     estimator_contact_samples: list[np.ndarray] = []
+
+    state_history: torch.Tensor | None = None
+    action_history: torch.Tensor | None = None
+    history_age: torch.Tensor | None = None
+    if dynamics is not None:
+        initial_state = torch.from_numpy(
+            _state_from_full_obs_np(full_observations, _actuator_force_np(env))
+        ).to(device)
+        initial_action = torch.from_numpy(full_observations[:, 36:48]).to(device)
+        state_history = initial_state[:, None, :].repeat(1, history_horizon, 1)
+        action_history = initial_action[:, None, :].repeat(1, history_horizon, 1)
+        history_age = torch.zeros(args.num_envs, dtype=torch.long, device=device)
 
     print(f"[Go2-FlashSAC-RWM-Proprioceptive-Eval] checkpoint={checkpoint_path}")
     print(
@@ -406,9 +472,34 @@ def main() -> None:
                 world_model_action_mask_indices=world_model_action_mask_indices,
             )
             action_abs_samples.append(float(np.abs(actions_np).mean()))
+            action_saturation_samples.append(float((np.abs(actions_np) >= 0.95).mean()))
+            if previous_actions_np is not None:
+                action_delta_abs_samples.append(float(np.abs(actions_np - previous_actions_np).mean()))
+            previous_actions_np = actions_np.copy()
             base_lin_vel_samples.append(full_observations[:, 0:3].copy())
             base_ang_vel_samples.append(full_observations[:, 3:6].copy())
             command_samples.append(full_observations[:, 9:12].copy())
+            projected_gravity = full_observations[:, 6:9]
+            roll_proxy = np.arctan2(projected_gravity[:, 1], -projected_gravity[:, 2])
+            pitch_proxy = np.arctan2(
+                -projected_gravity[:, 0],
+                np.sqrt(np.square(projected_gravity[:, 1]) + np.square(projected_gravity[:, 2])),
+            )
+            tilt = np.arccos(np.clip(-projected_gravity[:, 2], -1.0, 1.0))
+            roll_abs_samples.append(float(np.abs(roll_proxy).mean()))
+            pitch_abs_samples.append(float(np.abs(pitch_proxy).mean()))
+            tilt_samples.append(float(tilt.mean()))
+            step_vel_error_xy.append(
+                float(
+                    np.linalg.norm(
+                        full_observations[:, 0:2] - full_observations[:, 9:11],
+                        axis=1,
+                    ).mean()
+                )
+            )
+            step_vel_error_yaw.append(
+                float(np.abs(full_observations[:, 5] - full_observations[:, 11]).mean())
+            )
             if args.validate_contact_velocity_estimator:
                 robot_data = env.scene["robot"].data
                 contact_data = env.scene["feet_ground_contact"].data.found
@@ -438,6 +529,16 @@ def main() -> None:
                     contact.detach().cpu().numpy().astype(np.float32)
                 )
             actions_t = torch.from_numpy(actions_np).to(device=device, dtype=torch.float32)
+            if dynamics is not None:
+                assert state_history is not None and action_history is not None and history_age is not None
+                action_history = torch.cat((action_history[:, 1:], actions_t[:, None, :]), dim=1)
+                model_ids = torch.zeros(args.num_envs, dtype=torch.long, device=device)
+                _, _, epistemic, _, _ = dynamics.predict(state_history, action_history, model_ids)
+                valid_history = history_age >= history_horizon - 1
+                epistemic_total_rows += int(valid_history.numel())
+                if valid_history.any():
+                    epistemic_samples.append(float(epistemic[valid_history].mean().cpu()))
+                    epistemic_valid_rows += int(valid_history.sum().item())
             obs_dict, rewards, terminateds, truncateds, extras = env.step(actions_t)
             rewards_np = rewards.detach().cpu().numpy().astype(np.float64)
             term_np = terminateds.detach().cpu().numpy().astype(bool)
@@ -445,7 +546,19 @@ def main() -> None:
             done_np = np.logical_or(term_np, trunc_np)
 
             ep_returns += rewards_np
+            rollout_returns += rewards_np
             ep_lengths += 1
+
+            # First-failure statistics describe survival independently of the
+            # environment's automatic resets. Include the failure step itself.
+            alive_before_step = first_failure_steps < 0
+            alive_reward_sums[alive_before_step] += rewards_np[alive_before_step]
+            alive_step_counts[alive_before_step] += 1
+
+            first_now = np.logical_and(term_np, first_failure_steps < 0)
+            first_failure_steps[first_now] = _step + 1
+            reset_counts += done_np.astype(np.int64)
+            termination_counts += term_np.astype(np.int64)
 
             if done_np.any():
                 completed_returns.extend(ep_returns[done_np].tolist())
@@ -460,17 +573,75 @@ def main() -> None:
 
             _force_fixed_command(env, current_command)
             full_observations = _apply_command_to_full_obs(_actor_obs(obs_dict), current_command)
+            if dynamics is not None:
+                assert state_history is not None and action_history is not None and history_age is not None
+                actual_state = torch.from_numpy(
+                    _state_from_full_obs_np(full_observations, _actuator_force_np(env))
+                ).to(device)
+                state_history = torch.cat((state_history[:, 1:], actual_state[:, None, :]), dim=1)
+                history_age += 1
+                if done_np.any():
+                    done_ids = torch.from_numpy(np.flatnonzero(done_np)).to(device=device, dtype=torch.long)
+                    reset_state = actual_state[done_ids]
+                    reset_action = torch.from_numpy(full_observations[done_np, 36:48]).to(device)
+                    state_history[done_ids] = reset_state[:, None, :].repeat(1, history_horizon, 1)
+                    action_history[done_ids] = reset_action[:, None, :].repeat(1, history_horizon, 1)
+                    history_age[done_ids] = 0
 
     env.close()
 
-    mean_return = _mean(completed_returns, fallback=float(ep_returns.mean()))
-    std_return = float(np.std(completed_returns)) if completed_returns else float(np.std(ep_returns))
-    mean_episode_length = _mean(completed_lengths, fallback=float(ep_lengths.mean()))
+    # Fixed-horizon policy comparisons must include every reward accrued by
+    # every environment, including rewards after auto-reset.  The previous
+    # implementation switched to completed episodes when any failure occurred,
+    # silently excluding surviving trajectories and producing contradictory
+    # termination/episode-length summaries.
+    mean_return = float(rollout_returns.mean())
+    std_return = float(rollout_returns.std())
+    residual_lengths = ep_lengths[ep_lengths > 0].astype(np.float64).tolist()
+    all_segment_lengths = [*completed_lengths, *residual_lengths]
+    mean_episode_length = _mean(all_segment_lengths, fallback=float(args.steps))
+    failed_mask = first_failure_steps >= 0
+    first_failure_or_censor = np.where(failed_mask, first_failure_steps, args.steps)
+    survival_at = {
+        str(horizon): float(
+            np.logical_or(~failed_mask, first_failure_steps > horizon).mean()
+        )
+        for horizon in (50, 100, 200, 500, 1000)
+        if horizon <= args.steps
+    }
+    km_times = [0]
+    km_survival = [1.0]
+    survival_probability = 1.0
+    for event_time in sorted(np.unique(first_failure_steps[failed_mask]).tolist()):
+        at_risk = int(np.sum(first_failure_or_censor >= event_time))
+        events = int(np.sum(first_failure_steps == event_time))
+        if at_risk > 0:
+            survival_probability *= 1.0 - events / at_risk
+        km_times.append(int(event_time))
+        km_survival.append(float(survival_probability))
     base_lin_vel = np.concatenate(base_lin_vel_samples, axis=0) if base_lin_vel_samples else np.zeros((1, 3))
     base_ang_vel = np.concatenate(base_ang_vel_samples, axis=0) if base_ang_vel_samples else np.zeros((1, 3))
     commands = np.concatenate(command_samples, axis=0) if command_samples else np.zeros((1, 3))
     vel_error_xy = np.linalg.norm(base_lin_vel[:, 0:2] - commands[:, 0:2], axis=1)
     yaw_error = np.abs(base_ang_vel[:, 2] - commands[:, 2])
+
+    post_switch_metrics: dict[str, float] = {}
+    if command_sequence and args.command_switch_steps > 0:
+        switch_starts = list(range(args.command_switch_steps, args.steps, args.command_switch_steps))
+        for horizon in (10, 25, 50):
+            xy_values = [
+                value
+                for start in switch_starts
+                for value in step_vel_error_xy[start : min(start + horizon, args.steps)]
+            ]
+            yaw_values = [
+                value
+                for start in switch_starts
+                for value in step_vel_error_yaw[start : min(start + horizon, args.steps)]
+            ]
+            post_switch_metrics[f"post_switch_error_vel_xy_{horizon}"] = _mean(xy_values)
+            post_switch_metrics[f"post_switch_error_vel_yaw_{horizon}"] = _mean(yaw_values)
+
     summary = {
         "checkpoint_path": str(checkpoint_path),
         "task": str(args.task),
@@ -487,12 +658,37 @@ def main() -> None:
         "command_sequence": [list(command) for command in command_sequence],
         "command_switch_steps": int(args.command_switch_steps),
         "mean_return": mean_return,
+        "fixed_horizon_return": mean_return,
         "std_return": std_return,
         "mean_episode_length": mean_episode_length,
+        "mean_completed_episode_return": _mean(completed_returns),
+        "mean_completed_episode_length": _mean(completed_lengths),
+        "mean_episode_length_with_right_censoring": mean_episode_length,
         "completed_episodes": len(completed_returns),
         "terminated_count": terminated_count,
         "timeout_count": timeout_count,
         "non_timeout_termination_count": terminated_count,
+        "termination_rate": float(failed_mask.mean()),
+        "survive_to_1000_ratio": float((~failed_mask).mean()),
+        **{f"survival_at_{horizon}": value for horizon, value in survival_at.items()},
+        "mean_time_to_first_failure_failed_only": (
+            float(first_failure_steps[failed_mask].mean()) if failed_mask.any() else None
+        ),
+        "restricted_mean_time_to_first_failure": float(first_failure_or_censor.mean()),
+        "terminations_per_1000_env_steps": float(
+            termination_counts.sum() * 1000.0 / (args.num_envs * args.steps)
+        ),
+        "mean_resets_per_env": float(reset_counts.mean()),
+        "std_resets_per_env": float(reset_counts.std()),
+        "reward_per_alive_step": float(
+            alive_reward_sums.sum() / max(1, alive_step_counts.sum())
+        ),
+        "first_failure_steps": first_failure_steps.tolist(),
+        "reset_counts_per_env": reset_counts.tolist(),
+        "termination_counts_per_env": termination_counts.tolist(),
+        "alive_reward_sums_per_env": alive_reward_sums.tolist(),
+        "alive_step_counts_per_env": alive_step_counts.tolist(),
+        "kaplan_meier": {"time": km_times, "survival": km_survival},
         "command_x": float(commands[:, 0].mean()),
         "command_y": float(commands[:, 1].mean()),
         "command_yaw": float(commands[:, 2].mean()),
@@ -503,6 +699,16 @@ def main() -> None:
         "error_vel_xy": float(vel_error_xy.mean()),
         "error_vel_yaw": float(yaw_error.mean()),
         "action_abs_mean": _mean(action_abs_samples),
+        "action_delta_abs_mean": _mean(action_delta_abs_samples),
+        "action_saturation_ratio": _mean(action_saturation_samples),
+        "roll_abs_mean": _mean(roll_abs_samples),
+        "pitch_abs_mean": _mean(pitch_abs_samples),
+        "tilt_mean": _mean(tilt_samples),
+        "epistemic_uncertainty": _mean(epistemic_samples, fallback=float("nan")),
+        "epistemic_valid_fraction": (
+            float(epistemic_valid_rows / epistemic_total_rows) if epistemic_total_rows else 0.0
+        ),
+        **post_switch_metrics,
     }
 
     if args.validate_contact_velocity_estimator and estimated_base_lin_vel_samples:

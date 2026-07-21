@@ -26,6 +26,7 @@ def test_failure_cost_is_ramped_before_terminal() -> None:
         previous_actions,
         terminated,
         terminal_penalty=-10.0,
+        override_terminal_reward=True,
         failure_backprop_steps=4,
         failure_backprop_penalty=4.0,
         action_saturation_threshold=0.95,
@@ -50,6 +51,134 @@ def test_saturation_filter_excludes_unsafe_trajectory() -> None:
     )
     selected, _ = _select_indices(summaries, args)
     assert np.array_equal(selected, np.asarray([0]))
+
+
+def _selection_args(**overrides: object) -> argparse.Namespace:
+    values = {
+        "selection": "random",
+        "selection_scope": "per_start",
+        "max_saturation_fraction": 1.0,
+        "seed": 0,
+        "select_ratio": 0.25,
+        "per_start_target_count": 0,
+        "failure_trajectory_ratio": 0.0,
+        "failure_transition_ratio": 0.0,
+        "scorer_checkpoint": None,
+        "command_motion_gate": True,
+        "min_linear_realization_ratio": 0.2,
+        "min_yaw_realization_ratio": 0.2,
+        "max_command_direction_violation_rate": 0.5,
+        "command_mode_weights": "pure_x:0.5,x_yaw:0.5",
+    }
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+def _motion_summary(group: str, mode: str, *, realization: float, direction: float = 0.0) -> dict:
+    return {
+        "comparison_group_key": group,
+        "command_mode": mode,
+        "command_linear_active": True,
+        "command_yaw_active": mode == "x_yaw",
+        "linear_velocity_realization_ratio_mean": realization,
+        "yaw_velocity_realization_ratio_mean": realization,
+        "command_direction_violation_rate": direction,
+        "command_projected_displacement": realization,
+        "yaw_net_change": realization if mode == "x_yaw" else 0.0,
+        "yaw_expected_change": 1.0 if mode == "x_yaw" else 0.0,
+        "terminal_flag": False,
+        "action_saturation_fraction": 0.0,
+    }
+
+
+def test_per_start_selection_never_uses_motion_gate_fallback() -> None:
+    summaries = [
+        _motion_summary("x0", "pure_x", realization=value)
+        for value in (0.1, 0.3, 0.4, 0.5)
+    ] + [
+        _motion_summary("xy0", "x_yaw", realization=value)
+        for value in (0.05, 0.08, 0.1, 0.15)
+    ]
+    with np.testing.assert_raises_regex(ValueError, "more rollout branches"):
+        _select_indices(summaries, _selection_args())
+
+
+def test_per_start_selection_replaces_group_with_only_severe_direction_errors() -> None:
+    summaries = [
+        _motion_summary("x0", "pure_x", realization=0.4),
+        _motion_summary("x0", "pure_x", realization=0.4),
+        _motion_summary("bad", "x_yaw", realization=0.4, direction=0.95),
+        _motion_summary("bad", "x_yaw", realization=0.4, direction=0.95),
+    ]
+    args = _selection_args(select_ratio=0.5)
+    with np.testing.assert_raises_regex(ValueError, "more rollout branches"):
+        _select_indices(summaries, args)
+
+
+def test_per_start_selection_keeps_exact_top_quartile_without_fallback() -> None:
+    summaries = []
+    for group in ("x0", "x1"):
+        summaries.extend(
+            _motion_summary(group, "pure_x", realization=value)
+            for value in (0.1, 0.3, 0.4, 0.5)
+        )
+    selected, _ = _select_indices(summaries, _selection_args(command_mode_weights=None))
+    assert len(selected) == 2
+    assert all(summaries[int(index)]["linear_velocity_realization_ratio_mean"] >= 0.2 for index in selected)
+    assert _selection_args().command_motion_gate
+
+
+def test_appended_branches_do_not_increase_fixed_per_start_target() -> None:
+    summaries = [
+        _motion_summary("x0", "pure_x", realization=value)
+        for value in (0.01, 0.02, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8)
+    ]
+    selected, _ = _select_indices(
+        summaries,
+        _selection_args(per_start_target_count=2, command_mode_weights=None),
+    )
+    assert len(selected) == 2
+
+
+def test_compound_command_rejects_missing_yaw_response() -> None:
+    summary = _motion_summary("xy0", "x_yaw", realization=0.4)
+    summary["yaw_net_change"] = 0.0
+    with np.testing.assert_raises_regex(ValueError, "rejected every candidate"):
+        _select_indices(
+            [summary, summary.copy(), summary.copy(), summary.copy()],
+            _selection_args(per_start_target_count=1, command_mode_weights=None),
+        )
+
+
+def test_terminal_reward_is_preserved_without_legacy_override() -> None:
+    rewards = torch.tensor([1.0, 2.0, 3.0])
+    actions = torch.zeros(3, 2)
+    shaped = _apply_replay_safety_costs(
+        rewards,
+        actions,
+        actions,
+        torch.tensor([0, 0, 1]),
+        terminal_penalty=-10.0,
+        override_terminal_reward=False,
+        failure_backprop_steps=0,
+        failure_backprop_penalty=0.0,
+        action_saturation_threshold=0.95,
+        action_saturation_penalty_scale=0.0,
+        action_delta_penalty_scale=0.0,
+    )
+    assert torch.equal(shaped, rewards)
+
+
+def test_per_start_mode_allocation_never_silently_shrinks() -> None:
+    summaries = []
+    for group in range(2):
+        summaries.extend(_motion_summary(f"x{group}", "pure_x", realization=0.4) for _ in range(4))
+    for group in range(2):
+        summaries.extend(_motion_summary(f"xy{group}", "x_yaw", realization=0.4) for _ in range(4))
+    selected, _ = _select_indices(summaries, _selection_args())
+    assert len(selected) == 4
+    assert sum(summaries[int(index)]["command_mode"] == "pure_x" for index in selected) == 2
+    assert sum(summaries[int(index)]["command_mode"] == "x_yaw" for index in selected) == 2
 
 
 def test_action_safety_summary_uses_any_saturated_dimension() -> None:

@@ -19,6 +19,10 @@ if str(REPO_ROOT) not in sys.path:
 
 from scripts.reinforcement_learning.rwm_dataset.dataset import stack_time_key
 from scripts.reinforcement_learning.rwm_trace.artifact_manifest import sha256_path
+from scripts.reinforcement_learning.rwm_trace.reference_summary import (
+    attach_references_to_summaries,
+    load_reference_map,
+)
 from scripts.reinforcement_learning.rwm_trace.scorer import load_scorer_checkpoint, score_summaries
 from scripts.reinforcement_learning.rwm_trace.trajectory import summarize_go2_trajectory
 
@@ -30,6 +34,56 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scorer_checkpoint", default=None)
     parser.add_argument("--selection", choices=("scorer", "random", "all"), default="scorer")
     parser.add_argument("--select_ratio", type=float, default=0.1)
+    parser.add_argument(
+        "--per_start_target_count",
+        type=int,
+        default=0,
+        help=(
+            "Fixed number selected for each dataset start when selection_scope=per_start. "
+            "Use this when extra rollout branches are appended only to repair capacity."
+        ),
+    )
+    parser.add_argument(
+        "--selection_scope",
+        choices=("global", "per_start"),
+        default="global",
+        help="Select globally or independently among rollouts sharing one dataset start state.",
+    )
+    parser.add_argument(
+        "--command_motion_gate",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Require non-stand trajectories to realize the commanded linear/yaw motion before scoring.",
+    )
+    parser.add_argument("--min_linear_realization_ratio", type=float, default=0.2)
+    parser.add_argument("--min_yaw_realization_ratio", type=float, default=0.2)
+    parser.add_argument(
+        "--min_linear_net_displacement",
+        type=float,
+        default=1.0e-3,
+        help="Reject active linear commands whose projected displacement is only numerical noise.",
+    )
+    parser.add_argument(
+        "--min_yaw_net_change",
+        type=float,
+        default=1.0e-3,
+        help="Reject active yaw commands whose integrated yaw response is only numerical noise.",
+    )
+    parser.add_argument("--max_command_direction_violation_rate", type=float, default=0.5)
+    parser.add_argument(
+        "--max_hard_direction_violation_rate",
+        type=float,
+        default=0.9,
+        help="Only candidates above this direction-error rate are permanently ineligible.",
+    )
+    parser.add_argument(
+        "--command_mode_weights",
+        default=None,
+        help=(
+            "Optional soft selection quotas such as stand:0.08,pure_x:0.25,... . "
+            "Unavailable non-stand quota is redistributed; stand is always capped at its configured fraction."
+        ),
+    )
     parser.add_argument("--trajectory_length", type=int, default=20)
     parser.add_argument("--trajectory_stride", type=int, default=20)
     parser.add_argument(
@@ -58,7 +112,13 @@ def parse_args() -> argparse.Namespace:
         "--terminal_penalty",
         type=float,
         default=-10.0,
-        help="Reward assigned to an environment-terminal transition after reward alignment.",
+        help="Legacy terminal reward used only when --override-terminal-reward is enabled.",
+    )
+    parser.add_argument(
+        "--override_terminal_reward",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Legacy shaping option. Disabled by default to match frozen-RWM rewards exactly.",
     )
     parser.add_argument("--failure_backprop_steps", type=int, default=0)
     parser.add_argument(
@@ -81,6 +141,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reward_source", choices=("rwm_aligned", "dataset"), default="rwm_aligned")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--summary_jsonl", default=None)
+    parser.add_argument(
+        "--reference_summaries",
+        default=None,
+        help="JSONL same-start frozen-RWM summaries used to score simulator candidates by residual value.",
+    )
     parser.add_argument("--summaries_only", action="store_true")
     parser.add_argument(
         "--allow_legacy_candidates",
@@ -106,6 +171,16 @@ def _candidate_windows(
         key: stack_time_key(dataset, key)
         for key in ("states", "actions", "next_states", "contacts", "terminations", "commands", "rewards")
     }
+    optional_diagnostics = {
+        key: stack_time_key(dataset, key)
+        for key in (
+            "trace_base_positions_w",
+            "trace_foot_positions_w",
+            "trace_foot_velocities_w",
+        )
+        if dataset.get(key) is not None
+    }
+    step_dt = float((dataset.get("metadata") or {}).get("dt", 0.02))
     if dataset.get("prev_actions") is None:
         raise ValueError(
             "TRACE candidate dataset is missing prev_actions. Refusing the unsafe global-shift fallback."
@@ -164,6 +239,9 @@ def _candidate_windows(
             else float("nan")
         )
         trajectory["simulator_mismatch"] = mismatch
+        trajectory["step_dt"] = step_dt
+        for key, value in optional_diagnostics.items():
+            trajectory[key] = value[start:stop, env_id]
         candidates.append(trajectory)
         return True
 
@@ -252,8 +330,14 @@ def _validate_controlled_candidates(dataset: dict[str, Any], *, allow_legacy: bo
     if reset_mode == "exact_snapshot":
         if not trace.get("reset_is_exact", False):
             errors.append("exact_snapshot candidate does not declare reset_is_exact=true")
-        if not source_identity.get("available", False) or not source_identity.get("passed", False):
-            errors.append("exact snapshot did not reproduce the dataset source next_state")
+        source_identity_required = source_identity.get("required", True)
+        if source_identity_required:
+            if not source_identity.get("available", False) or not source_identity.get("passed", False):
+                errors.append("exact snapshot did not reproduce the dataset source next_state")
+        elif not source_identity.get("available", False):
+            errors.append("imperfect-simulator source-transition comparison is unavailable")
+        elif not source_identity.get("mismatch_expected", False):
+            errors.append("disabled source-transition identity does not declare mismatch_expected=true")
     elif reset_mode == "canonical_real_projection":
         if trace.get("reset_is_exact", False):
             errors.append("canonical real projection incorrectly claims an exact reset")
@@ -294,7 +378,7 @@ def _select_indices(
     count = len(summaries)
     if count == 0:
         raise ValueError("Candidate dataset contains no complete trajectory windows.")
-    eligible_indices = np.asarray(
+    safety_eligible_indices = np.asarray(
         [
             index
             for index, summary in enumerate(summaries)
@@ -303,8 +387,28 @@ def _select_indices(
         ],
         dtype=np.int64,
     )
-    if len(eligible_indices) == 0:
+    if len(safety_eligible_indices) == 0:
         raise ValueError("Safety filter rejected every candidate trajectory.")
+    motion_rejections: dict[str, int] = {}
+    strict_eligible: list[int] = []
+    for index in safety_eligible_indices:
+        summary = summaries[int(index)]
+        reason = _motion_gate_rejection_reason(summary, args)
+        if reason is None:
+            strict_eligible.append(int(index))
+        else:
+            motion_rejections[reason] = motion_rejections.get(reason, 0) + 1
+    eligible_indices = np.asarray(strict_eligible, dtype=np.int64)
+    if len(eligible_indices) == 0:
+        raise ValueError(f"Command-motion gate rejected every candidate trajectory: {motion_rejections}")
+    strict_set = set(strict_eligible)
+    diagnostics = {
+        "strict_eligible_count": len(strict_eligible),
+        "fallback_eligible_count": 0,
+        "hard_rejection_count": len(safety_eligible_indices) - len(eligible_indices),
+        "rejection_counts": motion_rejections,
+    }
+    setattr(args, "_selection_diagnostics", diagnostics)
     if args.selection == "all":
         scores = np.zeros(count, dtype=np.float32)
         return eligible_indices, scores
@@ -316,7 +420,6 @@ def _select_indices(
             raise ValueError("--scorer_checkpoint is required for scorer selection.")
         model, stats, _ = load_scorer_checkpoint(args.scorer_checkpoint)
         scores = score_summaries(model, summaries, stats)
-    selected_count = max(1, int(math.ceil(len(eligible_indices) * float(args.select_ratio))))
     jitter = rng.uniform(0.0, 1.0e-9, size=count)
     failure_indices = np.asarray(
         [
@@ -332,12 +435,90 @@ def _select_indices(
         (transition_target is None and trajectory_minimum <= 0.0)
         or (transition_target is not None and float(transition_target) <= 0.0)
     )
-    ranked = eligible_indices[np.argsort(-(scores[eligible_indices] + jitter[eligible_indices]))]
+    ranking_scores = scores + jitter
+
+    def ranked_with_strict_priority(indices: np.ndarray) -> np.ndarray:
+        return np.asarray(
+            sorted(
+                map(int, indices),
+                key=lambda index: (index not in strict_set, -float(ranking_scores[index])),
+            ),
+            dtype=np.int64,
+        )
+
+    ranked = ranked_with_strict_priority(eligible_indices)
     if quota_disabled:
         # A zero target disables forced failure composition. Natural terminal
         # trajectories remain eligible and are selected solely by the chosen
         # scorer/random ranking.
-        return ranked[:selected_count].astype(np.int64), scores
+        if getattr(args, "selection_scope", "global") == "per_start":
+            grouped: dict[str, list[int]] = {}
+            safety_group_sizes: dict[str, int] = {}
+            for index in safety_eligible_indices:
+                key = str(summaries[int(index)].get("comparison_group_key", ""))
+                if not key:
+                    raise ValueError("per_start selection requires comparison_group_key on every trajectory.")
+                safety_group_sizes[key] = safety_group_sizes.get(key, 0) + 1
+            for index in eligible_indices:
+                key = str(summaries[int(index)].get("comparison_group_key", ""))
+                grouped.setdefault(key, []).append(int(index))
+            selected = []
+            missing_groups = sorted(set(safety_group_sizes) - set(grouped))
+            fixed_group_target = int(getattr(args, "per_start_target_count", 0))
+            required_by_group = {
+                key: (
+                    fixed_group_target
+                    if fixed_group_target > 0
+                    else max(1, int(math.ceil(size * float(args.select_ratio))))
+                )
+                for key, size in safety_group_sizes.items()
+            }
+            requested_selected_count = sum(required_by_group.values())
+            insufficient_groups = {
+                key: {
+                    "eligible": len(grouped.get(key, ())),
+                    "required": required_by_group[key],
+                }
+                for key in safety_group_sizes
+                if len(grouped.get(key, ())) < required_by_group[key]
+            }
+            if insufficient_groups:
+                preview = dict(list(sorted(insufficient_groups.items()))[:20])
+                raise ValueError(
+                    "Motion-valid candidates cannot satisfy per-start top-k selection. "
+                    "Regenerate candidates with more rollout branches; replay will not be underfilled. "
+                    f"affected_groups={len(insufficient_groups)}, preview={preview}"
+                )
+            for key in sorted(safety_group_sizes):
+                group = np.asarray(grouped[key], dtype=np.int64)
+                group_count = required_by_group[key]
+                group_ranked = ranked_with_strict_priority(group)
+                selected.extend(map(int, group_ranked[: min(group_count, len(group_ranked))]))
+            selected_array = np.asarray(selected, dtype=np.int64)
+            diagnostics["requested_selected_count"] = requested_selected_count
+            diagnostics["target_selected_count"] = len(selected_array)
+            diagnostics["selection_shortfall_count"] = 0
+            diagnostics["start_group_count"] = len(safety_group_sizes)
+            diagnostics["missing_start_group_count"] = len(missing_groups)
+            diagnostics["missing_start_group_keys"] = missing_groups[:20]
+            diagnostics["additional_branch_fill_count"] = 0
+            diagnostics["selected_strict_count"] = sum(int(index) in strict_set for index in selected_array)
+            diagnostics["selected_fallback_count"] = len(selected_array) - diagnostics["selected_strict_count"]
+            return selected_array, scores
+        selected_count = max(1, int(math.ceil(len(eligible_indices) * float(args.select_ratio))))
+        weights = _parse_command_mode_weights(getattr(args, "command_mode_weights", None))
+        selected_array = (
+            _select_from_mode_pool(eligible_indices, summaries, ranking_scores, strict_set, weights, selected_count)
+            if weights
+            else ranked[:selected_count].astype(np.int64)
+        )
+        diagnostics["target_selected_count"] = selected_count
+        diagnostics["selected_strict_count"] = sum(int(index) in strict_set for index in selected_array)
+        diagnostics["selected_fallback_count"] = len(selected_array) - diagnostics["selected_strict_count"]
+        return selected_array, scores
+    if getattr(args, "selection_scope", "global") != "global":
+        raise ValueError("Forced failure quotas are incompatible with per_start selection.")
+    selected_count = max(1, int(math.ceil(len(eligible_indices) * float(args.select_ratio))))
     if transition_target is None:
         failure_count = min(
             len(failure_indices),
@@ -383,6 +564,199 @@ def _select_indices(
     return selected.astype(np.int64), scores
 
 
+def _motion_gate_rejection_reason(summary: dict[str, Any], args: argparse.Namespace) -> str | None:
+    if not bool(getattr(args, "command_motion_gate", False)):
+        return None
+    if str(summary.get("command_mode", "")) == "stand":
+        return None
+    direction_rate = float(summary.get("command_direction_violation_rate", float("nan")))
+    if not np.isfinite(direction_rate) or direction_rate > float(
+        getattr(args, "max_hard_direction_violation_rate", 0.9)
+    ):
+        return "severe_direction_violation"
+    if direction_rate > float(getattr(args, "max_command_direction_violation_rate", 0.5)):
+        return "direction_violation"
+    if bool(summary.get("command_linear_active", False)):
+        projected_displacement = float(
+            summary.get("command_projected_displacement", float("nan"))
+        )
+        if not np.isfinite(projected_displacement):
+            return "nonfinite_linear_displacement"
+        if projected_displacement <= 0.0:
+            return "opposite_linear_net_motion"
+        if projected_displacement < float(
+            getattr(args, "min_linear_net_displacement", 1.0e-3)
+        ):
+            yaw_change = abs(float(summary.get("yaw_net_change", 0.0)))
+            if np.isfinite(yaw_change) and yaw_change > 4.0 * max(
+                projected_displacement,
+                float(getattr(args, "min_linear_net_displacement", 1.0e-3)),
+            ):
+                return "linear_command_rotation_only"
+            return "near_zero_linear_net_motion"
+        ratio = float(summary.get("linear_velocity_realization_ratio_mean", float("nan")))
+        if not np.isfinite(ratio) or ratio < float(getattr(args, "min_linear_realization_ratio", 0.2)):
+            return "linear_realization"
+    if bool(summary.get("command_yaw_active", False)):
+        yaw_change = float(summary.get("yaw_net_change", float("nan")))
+        expected_yaw_change = float(summary.get("yaw_expected_change", float("nan")))
+        if not np.isfinite(yaw_change) or not np.isfinite(expected_yaw_change):
+            return "nonfinite_yaw_displacement"
+        if yaw_change * expected_yaw_change <= 0.0:
+            return "opposite_yaw_net_motion"
+        if abs(yaw_change) < float(getattr(args, "min_yaw_net_change", 1.0e-3)):
+            return "near_zero_yaw_net_motion"
+        ratio = float(summary.get("yaw_velocity_realization_ratio_mean", float("nan")))
+        if not np.isfinite(ratio) or ratio < float(getattr(args, "min_yaw_realization_ratio", 0.2)):
+            return "yaw_realization"
+    return None
+
+
+def _parse_command_mode_weights(spec: str | None) -> dict[str, float]:
+    if not spec:
+        return {}
+    weights = {}
+    for item in str(spec).split(","):
+        name, separator, raw_value = item.strip().partition(":")
+        if not separator or not name:
+            raise ValueError(f"Bad command mode weight entry: {item!r}")
+        value = float(raw_value)
+        if value < 0.0:
+            raise ValueError(f"Command mode weight must be non-negative: {item!r}")
+        weights[name] = value
+    total = sum(weights.values())
+    if total <= 0.0:
+        raise ValueError("Command mode weights must sum to a positive value.")
+    return {name: value / total for name, value in weights.items()}
+
+
+def _mode_target_counts(weights: dict[str, float], target_count: int) -> dict[str, int]:
+    raw = {mode: float(weight) * target_count for mode, weight in weights.items()}
+    counts = {mode: int(math.floor(value)) for mode, value in raw.items()}
+    remainder = target_count - sum(counts.values())
+    order = sorted(weights, key=lambda mode: (-(raw[mode] - counts[mode]), mode))
+    for mode in order[:remainder]:
+        counts[mode] += 1
+    return counts
+
+
+def _select_from_mode_pool(
+    eligible: np.ndarray,
+    summaries: list[dict[str, Any]],
+    ranking_scores: np.ndarray,
+    strict_set: set[int],
+    weights: dict[str, float],
+    target_count: int,
+) -> np.ndarray:
+    """Allocate from the complete eligible pool and return exactly target_count rows."""
+
+    by_mode: dict[str, list[int]] = {}
+    for index in eligible:
+        mode = str(summaries[int(index)].get("command_mode", "unknown"))
+        by_mode.setdefault(mode, []).append(int(index))
+    for values in by_mode.values():
+        values.sort(key=lambda index: (index not in strict_set, -float(ranking_scores[index])))
+
+    targets = _mode_target_counts(weights, target_count)
+    chosen: list[int] = []
+    chosen_set: set[int] = set()
+    for mode, quota in targets.items():
+        for index in by_mode.get(mode, [])[:quota]:
+            chosen.append(index)
+            chosen_set.add(index)
+
+    # Missing quota is redistributed only among locomotion modes. Stand remains
+    # capped at its requested largest-remainder allocation.
+    remaining = sorted(
+        (
+            int(index) for index in eligible
+            if int(index) not in chosen_set
+            and str(summaries[int(index)].get("command_mode", "unknown")) != "stand"
+        ),
+        key=lambda index: (index not in strict_set, -float(ranking_scores[index])),
+    )
+    for index in remaining:
+        if len(chosen) >= target_count:
+            break
+        chosen.append(index)
+        chosen_set.add(index)
+
+    if len(chosen) != target_count:
+        available = {mode: len(indices) for mode, indices in sorted(by_mode.items())}
+        raise ValueError(
+            "Cannot satisfy exact command-mode replay size without converting missing locomotion "
+            f"quota into stand: selected={len(chosen)}, target={target_count}, available={available}"
+        )
+    return np.asarray(chosen, dtype=np.int64)
+
+
+def _validate_per_start_mode_allocation(
+    selected: np.ndarray,
+    summaries: list[dict[str, Any]],
+    weights: dict[str, float],
+) -> None:
+    target = _mode_target_counts(weights, len(selected))
+    actual = {
+        mode: sum(str(summaries[int(index)].get("command_mode", "unknown")) == mode for index in selected)
+        for mode in weights
+    }
+    deficits = {
+        mode: target[mode] - actual.get(mode, 0)
+        for mode in target
+        if mode != "stand" and actual.get(mode, 0) < target[mode]
+    }
+    if actual.get("stand", 0) > target.get("stand", 0):
+        raise ValueError(
+            "Per-start replay exceeds the stand cap. Regenerate candidates with "
+            f"stratified reset-state sampling. target={target}, actual={actual}, deficits={deficits}"
+        )
+
+
+def _fill_per_start_shortfall(
+    selected: np.ndarray,
+    eligible: np.ndarray,
+    summaries: list[dict[str, Any]],
+    ranking_scores: np.ndarray,
+    strict_set: set[int],
+    weights: dict[str, float],
+    target_count: int,
+) -> np.ndarray:
+    if len(selected) > target_count:
+        raise RuntimeError(f"Per-start selection produced {len(selected)} rows for target {target_count}.")
+    chosen = list(map(int, selected))
+    chosen_set = set(chosen)
+    targets = _mode_target_counts(weights, target_count) if weights else {}
+
+    def mode(index: int) -> str:
+        return str(summaries[index].get("command_mode", "unknown"))
+
+    def counts() -> dict[str, int]:
+        return {name: sum(mode(index) == name for index in chosen) for name in targets}
+
+    remaining = [int(index) for index in eligible if int(index) not in chosen_set and mode(int(index)) != "stand"]
+    remaining.sort(key=lambda index: (index not in strict_set, -float(ranking_scores[index])))
+    while len(chosen) < target_count:
+        current = counts()
+        deficits = {name for name, target in targets.items() if name != "stand" and current.get(name, 0) < target}
+        candidate_position = next(
+            (position for position, index in enumerate(remaining) if not deficits or mode(index) in deficits),
+            None,
+        )
+        if candidate_position is None and remaining:
+            # The missing mode has no eligible branch. Redistribute only to
+            # another locomotion mode; never use stand to hide the shortfall.
+            candidate_position = 0
+        if candidate_position is None:
+            raise ValueError(
+                "Cannot fill exact per-start replay size from locomotion candidates: "
+                f"selected={len(chosen)}, target={target_count}, mode_counts={current}, targets={targets}"
+            )
+        index = remaining.pop(candidate_position)
+        chosen.append(index)
+        chosen_set.add(index)
+    return np.asarray(chosen, dtype=np.int64)
+
+
 def _apply_replay_safety_costs(
     rewards: torch.Tensor,
     actions: torch.Tensor,
@@ -390,6 +764,7 @@ def _apply_replay_safety_costs(
     terminated: torch.Tensor,
     *,
     terminal_penalty: float,
+    override_terminal_reward: bool = False,
     failure_backprop_steps: int,
     failure_backprop_penalty: float,
     action_saturation_threshold: float,
@@ -410,7 +785,8 @@ def _apply_replay_safety_costs(
             if count > 0:
                 ramp = torch.linspace(1.0 / count, 1.0, count, dtype=rewards.dtype)
                 rewards[start:terminal_index] -= float(failure_backprop_penalty) * ramp
-    rewards[terminated] = float(terminal_penalty)
+    if override_terminal_reward:
+        rewards[terminated] = float(terminal_penalty)
     return rewards
 
 
@@ -419,6 +795,7 @@ def _align_rewards_with_rwm(
     step_dt: float,
     terminal_penalty: float,
     *,
+    override_terminal_reward: bool,
     failure_backprop_steps: int,
     failure_backprop_penalty: float,
     action_saturation_threshold: float,
@@ -460,6 +837,7 @@ def _align_rewards_with_rwm(
         trajectory["prev_actions"],
         trajectory["terminations"],
         terminal_penalty=terminal_penalty,
+        override_terminal_reward=override_terminal_reward,
         failure_backprop_steps=failure_backprop_steps,
         failure_backprop_penalty=failure_backprop_penalty,
         action_saturation_threshold=action_saturation_threshold,
@@ -540,6 +918,15 @@ def main() -> None:
         raise ValueError("Action penalty scales must be non-negative.")
     if args.trajectory_length < 1 or args.trajectory_stride < 1 or args.n_step < 1:
         raise ValueError("Trajectory length, stride, and n_step must be positive.")
+    for name in (
+        "min_linear_realization_ratio",
+        "min_yaw_realization_ratio",
+        "max_command_direction_violation_rate",
+        "max_hard_direction_violation_rate",
+    ):
+        value = float(getattr(args, name))
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"--{name} must be in [0, 1], got {value}.")
     if not args.summaries_only and args.trajectory_length <= args.n_step:
         raise ValueError("trajectory_length must be greater than n_step when building replay.")
     dataset = torch.load(args.candidate_dataset, map_location="cpu", weights_only=False)
@@ -558,6 +945,7 @@ def main() -> None:
                 candidate,
                 step_dt,
                 float(args.terminal_penalty),
+                override_terminal_reward=bool(args.override_terminal_reward),
                 failure_backprop_steps=int(args.failure_backprop_steps),
                 failure_backprop_penalty=float(args.failure_backprop_penalty),
                 action_saturation_threshold=float(args.action_saturation_threshold),
@@ -565,12 +953,41 @@ def main() -> None:
                 action_delta_penalty_scale=float(args.action_delta_penalty_scale),
             )
     summaries = [summarize_go2_trajectory(candidate) for candidate in candidates]
+    trace_metadata = dict((dataset.get("metadata") or {}).get("trace_candidates") or {})
+    reset_dataset = trace_metadata.get("reset_dataset")
+    reset_path = Path(reset_dataset).expanduser() if reset_dataset else None
+    source_namespace = (
+        sha256_path(reset_path)[:16]
+        if reset_path is not None and reset_path.is_file()
+        else str(trace_metadata.get("reset_dataset_sha256", ""))[:16]
+    )
+    if not source_namespace:
+        raise ValueError(
+            "TRACE candidate metadata cannot identify the reset dataset. A stable source namespace "
+            "is required to prevent scorer train/validation leakage across refreshes."
+        )
     candidate_namespace = sha256_path(args.candidate_dataset)[:16]
     for summary, candidate in zip(summaries, candidates, strict=True):
         summary["start_state_key"] = f"{candidate_namespace}:{int(candidate['start_state_id'])}"
-        summary["comparison_group_key"] = summary["start_state_key"]
+        summary["source_state_key"] = f"{source_namespace}:{int(candidate['start_state_id'])}"
+        summary["comparison_group_key"] = summary["source_state_key"]
         summary["candidate_namespace"] = candidate_namespace
         _add_action_safety_summary(summary, candidate, args.action_saturation_threshold)
+    if args.reference_summaries:
+        summaries = attach_references_to_summaries(
+            summaries,
+            load_reference_map(args.reference_summaries),
+            strict=True,
+        )
+    for summary in summaries:
+        rejection = _motion_gate_rejection_reason(summary, args)
+        summary["command_motion_gate_passed"] = rejection is None
+        summary["command_motion_gate_rejection_reason"] = rejection
+        summary["command_motion_gate_tier"] = (
+            "strict"
+            if rejection is None
+            else "rejected"
+        )
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     summary_path = (
@@ -585,6 +1002,12 @@ def main() -> None:
         print(f"Wrote {len(summaries)} candidate summaries to {summary_path}")
         return
     selected_indices, scores = _select_indices(summaries, args)
+    selection_diagnostics = dict(getattr(args, "_selection_diagnostics", {}))
+    expected_selected = selection_diagnostics.get("target_selected_count")
+    if expected_selected is not None and len(selected_indices) != int(expected_selected):
+        raise RuntimeError(
+            f"Replay selection silently changed size: selected={len(selected_indices)}, target={expected_selected}."
+        )
     selected_set = set(int(index) for index in selected_indices)
     for index, summary in enumerate(summaries):
         summary["trace_score"] = float(scores[index])
@@ -616,10 +1039,24 @@ def main() -> None:
             "trace_protocol_version": "go2_trace_v5_controlled",
             "candidate_dataset": str(Path(args.candidate_dataset).resolve()),
             "candidate_dataset_sha256": sha256_path(args.candidate_dataset),
+            "reference_summaries": (
+                str(Path(args.reference_summaries).resolve()) if args.reference_summaries else None
+            ),
+            "reference_summaries_sha256": (
+                sha256_path(args.reference_summaries) if args.reference_summaries else None
+            ),
             "scorer_checkpoint": str(Path(args.scorer_checkpoint).resolve()) if args.scorer_checkpoint else None,
             "scorer_checkpoint_sha256": sha256_path(args.scorer_checkpoint) if args.scorer_checkpoint else None,
             "selection": args.selection,
+            "selection_scope": str(args.selection_scope),
             "select_ratio": float(args.select_ratio),
+            "per_start_target_count": int(args.per_start_target_count),
+            "command_motion_gate": bool(args.command_motion_gate),
+            "min_linear_realization_ratio": float(args.min_linear_realization_ratio),
+            "min_yaw_realization_ratio": float(args.min_yaw_realization_ratio),
+            "max_command_direction_violation_rate": float(args.max_command_direction_violation_rate),
+            "max_hard_direction_violation_rate": float(args.max_hard_direction_violation_rate),
+            "command_mode_weights": _parse_command_mode_weights(args.command_mode_weights),
             "trajectory_length": int(args.trajectory_length),
             "trajectory_stride": int(args.trajectory_stride),
             "include_terminal_prefixes": bool(args.include_terminal_prefixes),
@@ -640,6 +1077,7 @@ def main() -> None:
                 else "forced_target"
             ),
             "terminal_penalty": float(args.terminal_penalty),
+            "override_terminal_reward": bool(args.override_terminal_reward),
             "failure_backprop_steps": int(args.failure_backprop_steps),
             "failure_backprop_penalty": float(args.failure_backprop_penalty),
             "action_saturation_threshold": float(args.action_saturation_threshold),
@@ -649,6 +1087,10 @@ def main() -> None:
             "n_step": int(args.n_step),
             "gamma": float(args.gamma),
             "reward_source": str(args.reward_source),
+            "reward_alignment_scope": "common_go2_task_terms_only",
+            "epistemic_uncertainty_source": "not_applicable_true_simulator_transition",
+            "epistemic_uncertainty_value": 0.0,
+            "rwm_buffer_may_apply_model_uncertainty_penalty": True,
             "candidate_count": len(candidates),
             "safety_eligible_candidate_count": int(
                 sum(
@@ -658,6 +1100,29 @@ def main() -> None:
                 )
             ),
             "selected_trajectory_count": len(selected_indices),
+            "selection_diagnostics": selection_diagnostics,
+            "command_motion_gate_eligible_count": int(
+                sum(bool(summary["command_motion_gate_passed"]) for summary in summaries)
+            ),
+            "command_motion_gate_rejection_counts": {
+                reason: int(
+                    sum(summary["command_motion_gate_rejection_reason"] == reason for summary in summaries)
+                )
+                for reason in (
+                    "severe_direction_violation",
+                    "direction_violation",
+                    "linear_realization",
+                    "yaw_realization",
+                )
+            },
+            "candidate_command_mode_counts": {
+                mode: int(sum(summary.get("command_mode") == mode for summary in summaries))
+                for mode in sorted({str(summary.get("command_mode", "unknown")) for summary in summaries})
+            },
+            "selected_command_mode_counts": {
+                mode: int(sum(summaries[int(index)].get("command_mode") == mode for index in selected_indices))
+                for mode in sorted({str(summary.get("command_mode", "unknown")) for summary in summaries})
+            },
             "candidate_terminal_trajectory_count": int(
                 sum(bool(summary.get("terminal_flag", False)) for summary in summaries)
             ),

@@ -25,6 +25,7 @@ from flash_rl.agents.utils.reward_normalization import RewardNormalizer
 from flash_rl.agents.utils.scheduler import warmup_cosine_decay_scheduler
 from flash_rl.buffers.torch_buffer import TorchUniformBuffer
 from flash_rl.types import NDArray, Tensor
+from flash_rl.agents.flashSAC.update_schedule import should_update_actor
 
 
 @dataclass
@@ -78,6 +79,7 @@ class FlashSACConfig:
     load_reward_normalizer: bool
 
     buffer_obs_dtype: Optional[str] = None
+    actor_learning_starts_updates: int = 0
 
 
 def _init_flashsac_networks(
@@ -428,6 +430,19 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
         self._trace_replay_sampler = None
         self._trace_replay_ratio = 0.0
 
+    def reset_action_noise(self, batch_shape: tuple[int, ...]) -> None:
+        """Start an independent temporally-correlated noise process for a rollout batch."""
+
+        shape = (*tuple(int(value) for value in batch_shape), self._action_dim)
+        self._cached_noise = torch.randn(shape, device=self._device)
+        self._cur_noise_repeat_n = torch.tensor(1, dtype=torch.int32, device=self._device)
+        self._cur_noise_repeat_count = torch.tensor(0, dtype=torch.int32, device=self._device)
+
+    def _ensure_action_noise_shape(self, observations: torch.Tensor) -> None:
+        expected = (*tuple(int(value) for value in observations.shape[:-1]), self._action_dim)
+        if tuple(self._cached_noise.shape) != expected:
+            self.reset_action_noise(tuple(int(value) for value in observations.shape[:-1]))
+
     def configure_trace_replay(self, sampler: Any, ratio: float) -> None:
         if not 0.0 <= float(ratio) <= 1.0:
             raise ValueError(f"TRACE replay ratio must be in [0, 1], got {ratio}.")
@@ -450,6 +465,7 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
             observations = observations[:, : self._actor_observation_dim]
 
         observations = torch.as_tensor(observations, dtype=torch.float32).to(self._device)
+        self._ensure_action_noise_shape(observations)
 
         with torch.no_grad():
             (
@@ -514,6 +530,11 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
             batch["reward"] = self.reward_normalizer.normalize_rewards(batch["reward"])
 
         # Update step
+        actor_update_enabled = should_update_actor(
+            update_step=self._update_step,
+            actor_learning_starts_updates=self._cfg.actor_learning_starts_updates,
+            actor_update_period=self._cfg.actor_update_period,
+        )
         _update_info = _update_networks(
             batch=batch,
             actor=self._actor,
@@ -521,7 +542,7 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
             target_critic=self._target_critic,
             temperature=self._temperature,
             cfg=self._cfg,
-            do_actor_update=(self._update_step % self._cfg.actor_update_period == 0),
+            do_actor_update=actor_update_enabled,
             device=self._device,
             grad_scaler=self._grad_scaler,
         )
@@ -536,6 +557,10 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
                 update_info[key] = float(value)
 
         update_info["trace/replay_batch_fraction"] = float(trace_count / max(len(batch["reward"]), 1))
+        update_info["actor/update_enabled"] = float(actor_update_enabled)
+        update_info["actor/critic_warmup_remaining"] = float(
+            max(self._cfg.actor_learning_starts_updates - self._update_step, 0)
+        )
 
         return update_info
 
@@ -579,6 +604,10 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
             self.reward_normalizer.load(os.path.join(path, "reward_normalizer.pt"))
 
         print(f"\033[32m[FlashSAC]\033[0m Successfully loaded checkpoint from {path}.")
+
+    def load_actor_only(self, path: str) -> None:
+        self._actor.load(os.path.join(path, "actor.pt"), load_optimizer=False)
+        print(f"\033[32m[FlashSAC]\033[0m Successfully loaded actor from {path}.")
 
     def load_replay_buffer(self, path: str) -> None:
         self._replay_buffer.load(os.path.join(path, "replay_buffer.pt"))

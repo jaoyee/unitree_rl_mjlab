@@ -27,6 +27,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--window_length", type=int, default=40)
     parser.add_argument("--stride", type=int, default=20)
     parser.add_argument("--action_saturation_threshold", type=float, default=0.95)
+    parser.add_argument(
+        "--comparison_group",
+        choices=("episode", "start"),
+        default="episode",
+        help=(
+            "Leakage group for scorer validation. Use episode for normal summaries; "
+            "use start for initial real-data scorer windows when rare modes appear in "
+            "too few episodes to support an episode-level split."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -87,6 +97,7 @@ def main() -> None:
                 "start_state_id": window_start,
                 "reset_reconstruction_error": float("nan"),
                 "simulator_mismatch": {"source": "expert_dataset"},
+                "nominal_horizon": args.window_length,
             }
             summary = summarize_go2_trajectory(trajectory)
             saturated = (actions[window_start:window_stop].abs() > args.action_saturation_threshold).any(dim=-1)
@@ -96,7 +107,11 @@ def main() -> None:
                 (actions[window_start:window_stop] - prev_actions[window_start:window_stop]).abs().mean()
             )
             summary["start_state_key"] = f"{namespace}:{window_start}"
-            summary["comparison_group_key"] = f"{namespace}:episode:{episode}"
+            if args.comparison_group == "start":
+                summary["comparison_group_key"] = f"{namespace}:start:{window_start}"
+            else:
+                summary["comparison_group_key"] = f"{namespace}:episode:{episode}"
+            summary["comparison_group_scope"] = args.comparison_group
             summary["candidate_namespace"] = namespace
             summary["source_kind"] = "expert_dataset_window"
             summaries.append(summary)
@@ -114,6 +129,7 @@ def main() -> None:
         "dataset_sha256": sha256_path(path),
         "window_length": args.window_length,
         "stride": args.stride,
+        "comparison_group": args.comparison_group,
         "summary_count": len(summaries),
         "output": str(output),
     }, indent=2, sort_keys=True))

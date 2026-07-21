@@ -22,6 +22,9 @@ from scripts.reinforcement_learning.rwm_trace.scorer import (
     score_summaries,
 )
 from scripts.reinforcement_learning.rwm_trace.trajectory import summarize_go2_trajectory
+from scripts.reinforcement_learning.rwm_trace.train_go2_trace_scorer import (
+    _zero_all_missing_input_weights,
+)
 from scripts.reinforcement_learning.rwm_trace.simulator_reset import (
     quaternion_wxyz_from_roll_pitch,
     roll_pitch_from_projected_gravity,
@@ -29,12 +32,27 @@ from scripts.reinforcement_learning.rwm_trace.simulator_reset import (
 
 
 class TraceScorerTest(unittest.TestCase):
+    def test_all_missing_privileged_features_have_zero_input_weights(self) -> None:
+        feature_count = len(GO2_FEATURE_NAMES)
+        features = np.zeros((4, 2 * feature_count), dtype=np.float32)
+        missing_index = GO2_FEATURE_NAMES.index("foot_height_range_rr")
+        features[:, feature_count + missing_index] = 1.0
+        model = Go2TraceScorer(2 * feature_count, hidden_dim=8)
+        names = _zero_all_missing_input_weights(model, features)
+        self.assertIn("foot_height_range_rr", names)
+        self.assertTrue(torch.all(model.net[0].weight[:, missing_index] == 0.0))
+        self.assertTrue(
+            torch.all(model.net[0].weight[:, feature_count + missing_index] == 0.0)
+        )
+
     def test_summary_and_checkpoint_round_trip(self) -> None:
         length = 20
         states = torch.zeros(length, 45)
         next_states = states.clone()
         next_states[:, 0] = 0.2
         next_states[:, 8] = -1.0
+        next_states[:, 17] = -3.0
+        next_states[:, 20] = 0.75
         trajectory = {
             "trajectory_id": "candidate-1",
             "states": states,
@@ -48,6 +66,7 @@ class TraceScorerTest(unittest.TestCase):
         summary = summarize_go2_trajectory(trajectory)
         self.assertAlmostEqual(summary["simulator_return"], 20.0)
         self.assertAlmostEqual(summary["linear_tracking_error_mean"], 0.0)
+        self.assertAlmostEqual(summary["rr_calf_relative_position_mean"], 0.75)
         features = feature_matrix([summary, summary], GO2_FEATURE_NAMES)
         stats = fit_feature_stats(features)
         model = Go2TraceScorer(features.shape[-1], hidden_dim=8)

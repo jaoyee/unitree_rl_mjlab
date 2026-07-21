@@ -33,7 +33,7 @@ from scripts.reinforcement_learning.rwm_flashsac.world_model_env import (
     FlashSACWorldModelEnvConfig,
     Go2RWMFlashSACWorldModelEnv,
 )
-from scripts.reinforcement_learning.rwm_trace.replay import TraceReplaySampler
+from scripts.reinforcement_learning.rwm_trace.replay import TraceReplaySampler, V10TraceReplaySampler
 
 
 class ScalarLogger:
@@ -77,10 +77,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--model_resume_path", default=None)
     parser.add_argument("--dataset_path", default=None)
     parser.add_argument("--policy_resume_path", default=None)
+    parser.add_argument("--policy_resume_mode", choices=("full", "actor_only"), default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--num_imagination_envs", type=int, default=None)
     parser.add_argument("--num_env_steps", type=int, default=None)
     parser.add_argument("--save_path", default=None)
+    parser.add_argument("--load_replay_buffer", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--save_replay_buffer", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--overrides", action="append", default=[])
     return parser.parse_args()
@@ -94,6 +96,10 @@ def _apply_arg_overrides(cfg: Any, args: argparse.Namespace) -> Any:
         updates.append(f"dataset_path={args.dataset_path}")
     if args.policy_resume_path is not None:
         updates.append(f"policy_resume_path={args.policy_resume_path}")
+    if args.policy_resume_mode is not None:
+        updates.append(f"policy_resume_mode={args.policy_resume_mode}")
+    if args.load_replay_buffer is not None:
+        updates.append(f"load_replay_buffer={str(args.load_replay_buffer).lower()}")
     if args.num_imagination_envs is not None:
         updates.append(f"num_imagination_envs={args.num_imagination_envs}")
     if args.num_env_steps is not None:
@@ -184,8 +190,18 @@ def main() -> None:
     policy_resume_value = OmegaConf.select(cfg, "policy_resume_path", default=None)
     if policy_resume_value:
         policy_resume_path = resolve_repo_path(str(policy_resume_value))
-        agent.load(str(policy_resume_path))
-        if (policy_resume_path / "replay_buffer.pt").exists():
+        policy_resume_mode = str(OmegaConf.select(cfg, "policy_resume_mode", default="full"))
+        if policy_resume_mode == "actor_only":
+            load_actor_only = getattr(agent, "load_actor_only", None)
+            if load_actor_only is None:
+                raise RuntimeError("Agent does not support actor-only resume.")
+            load_actor_only(str(policy_resume_path))
+        elif policy_resume_mode == "full":
+            agent.load(str(policy_resume_path))
+        else:
+            raise ValueError(f"Unknown policy_resume_mode: {policy_resume_mode!r}")
+        load_replay_buffer = bool(OmegaConf.select(cfg, "load_replay_buffer", default=True))
+        if policy_resume_mode == "full" and load_replay_buffer and (policy_resume_path / "replay_buffer.pt").exists():
             agent.load_replay_buffer(str(policy_resume_path))
 
     trace_enabled = bool(OmegaConf.select(cfg, "trace.enabled", default=False))
@@ -197,32 +213,74 @@ def main() -> None:
             raise ValueError("trace.enabled=true requires trace.replay_path.")
         trace_ratio = float(OmegaConf.select(cfg, "trace.replay_ratio", default=0.1))
         trace_seed = int(OmegaConf.select(cfg, "trace.seed", default=int(cfg.seed)))
-        trace_sampler = TraceReplaySampler(resolve_repo_path(str(trace_path_value)), seed=trace_seed)
+        trace_path = resolve_repo_path(str(trace_path_value))
+        trace_protocol_required = str(OmegaConf.select(cfg, "trace.protocol", default="go2_trace_v10"))
+        if trace_protocol_required == "go2_trace_v10":
+            trace_sampler = V10TraceReplaySampler(trace_path, seed=trace_seed)
+            protocol = trace_sampler.metadata.get("protocol_version")
+            replay_obs_dim = trace_sampler.observation_dim
+            replay_action_dim = trace_sampler.action_dim
+            replay_n_step = trace_sampler.n_step
+            replay_gamma = trace_sampler.gamma
+            replay_protocol = trace_sampler.protocol["replay"]
+            training_protocol = trace_sampler.protocol["training"]
+            if int(agent_cfg.sample_batch_size) != int(replay_protocol["primary_batch_size"]):
+                raise ValueError(
+                    "TRACE V10 freezes the FlashSAC batch size: "
+                    f"policy={agent_cfg.sample_batch_size}, protocol={replay_protocol['primary_batch_size']}."
+                )
+            if not np.isclose(trace_ratio, float(replay_protocol["ratio"])):
+                raise ValueError(
+                    f"TRACE V10 freezes replay ratio={replay_protocol['ratio']}, got {trace_ratio}."
+                )
+            expected_trace_rows = int(round(int(agent_cfg.sample_batch_size) * trace_ratio))
+            if expected_trace_rows != int(replay_protocol["trace_rows_per_batch"]):
+                raise ValueError("TRACE V10 replay-row count does not match its protocol.")
+            if int(agent_cfg.buffer_max_length) != int(replay_protocol["rwm_buffer_max_length"]):
+                raise ValueError(
+                    "TRACE V10 freezes the RWM replay capacity: "
+                    f"policy={agent_cfg.buffer_max_length}, protocol={replay_protocol['rwm_buffer_max_length']}."
+                )
+            if int(cfg.num_imagination_envs) != int(training_protocol["imagination_environments"]):
+                raise ValueError(
+                    "TRACE V10 freezes the imagination environment count: "
+                    f"policy={cfg.num_imagination_envs}, protocol={training_protocol['imagination_environments']}."
+                )
+            if int(cfg.updates_per_interaction_step) != int(
+                training_protocol["updates_per_interaction_step"]
+            ):
+                raise ValueError(
+                    "TRACE V10 freezes updates_per_interaction_step: "
+                    f"policy={cfg.updates_per_interaction_step}, "
+                    f"protocol={training_protocol['updates_per_interaction_step']}."
+                )
+        else:
+            trace_sampler = TraceReplaySampler(trace_path, seed=trace_seed)
+            protocol = trace_sampler.metadata.get("trace_protocol_version")
+            replay_obs_dim = int(trace_sampler.data["observation"].shape[-1])
+            replay_action_dim = int(trace_sampler.data["action"].shape[-1])
+            replay_n_step = trace_sampler.metadata.get("n_step")
+            replay_gamma = trace_sampler.metadata.get("gamma")
         allow_legacy_trace = bool(OmegaConf.select(cfg, "trace.allow_legacy", default=False))
-        protocol = trace_sampler.metadata.get("trace_protocol_version")
-        if protocol != "go2_trace_v5_controlled" and not allow_legacy_trace:
+        if protocol != trace_protocol_required and not allow_legacy_trace:
             raise ValueError(
-                "Formal TRACE training requires a controlled V5 replay artifact; "
-                f"got protocol={protocol!r}. Set trace.allow_legacy=true only for diagnostic reproduction."
+                f"Formal TRACE training requires protocol={trace_protocol_required!r}; got {protocol!r}. "
+                "Set trace.allow_legacy=true only for diagnostic reproduction."
             )
-        replay_obs_dim = int(trace_sampler.data["observation"].shape[-1])
         env_obs_dim = int(env.single_observation_space.shape[-1])
         if replay_obs_dim != env_obs_dim:
             raise ValueError(
                 f"TRACE replay observation width {replay_obs_dim} does not match RWM environment width {env_obs_dim}."
             )
-        replay_action_dim = int(trace_sampler.data["action"].shape[-1])
         if replay_action_dim != policy_action_dim:
             raise ValueError(
                 f"TRACE replay action width {replay_action_dim} does not match policy width {policy_action_dim}."
             )
-        replay_n_step = trace_sampler.metadata.get("n_step")
         if replay_n_step is None or int(replay_n_step) != int(agent_cfg.n_step):
             raise ValueError(
                 "TRACE replay n_step must match the FlashSAC replay configuration: "
                 f"artifact={replay_n_step}, policy={agent_cfg.n_step}."
             )
-        replay_gamma = trace_sampler.metadata.get("gamma")
         if replay_gamma is None or not np.isclose(float(replay_gamma), float(agent_cfg.gamma)):
             raise ValueError(
                 "TRACE replay gamma must match the FlashSAC replay configuration: "
@@ -255,6 +313,7 @@ def main() -> None:
     print(f"[Go2-FlashSAC-RWM] device={device}, num_envs={num_envs}, interaction_steps={total_interaction_steps}")
     print(f"[Go2-FlashSAC-RWM] full_action_dim={env.full_action_dim}, policy_action_dim={policy_action_dim}")
     print(f"[Go2-FlashSAC-RWM] policy_resume_path={policy_resume_value}")
+    print(f"[Go2-FlashSAC-RWM] policy_resume_mode={OmegaConf.select(cfg, 'policy_resume_mode', default='full')}")
     print(
         "[Go2-FlashSAC-RWM] "
         f"policy_action_mask_indices={list(wm_cfg.policy_action_mask_indices)}, "

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import shutil
 import subprocess
@@ -65,6 +66,72 @@ def write_jsonl(path: Path, rows: List[dict]) -> None:
 def load_json(path: Path) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _canonical_sha256(value: object) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return _sha256_bytes(payload.encode("utf-8"))
+
+
+def build_cache_identity(args, prompts: List[dict]) -> dict:
+    pair_fingerprints = []
+    for row in prompts:
+        pair_fingerprints.append(
+            {
+                "pair_id": str(row["pair_id"]),
+                "pair_sha256": _canonical_sha256(
+                    {
+                        "prompt": row.get("prompt"),
+                        "trajectory_i": row.get("trajectory_i", row.get("traj_i")),
+                        "trajectory_j": row.get("trajectory_j", row.get("traj_j")),
+                    }
+                ),
+            }
+        )
+    schema_path = Path(args.schema).expanduser().resolve()
+    return {
+        "schema_version": 1,
+        "prompts_path": str(Path(args.prompts).expanduser().resolve()),
+        "prompts_file_sha256": _sha256_path(Path(args.prompts).expanduser().resolve()),
+        "effective_pairs_sha256": _canonical_sha256(pair_fingerprints),
+        "schema_sha256": _sha256_path(schema_path),
+        "batch_size": int(args.batch_size),
+        "max_pairs": args.max_pairs,
+        "pair_fingerprints": pair_fingerprints,
+    }
+
+
+def bind_output_cache(out: Path, identity: dict) -> None:
+    identity_path = out / "label_cache_identity.json"
+    cached_responses = list((out / "raw_batches").glob("**/*_response.json"))
+    if identity_path.exists():
+        existing = load_json(identity_path)
+        if existing != identity:
+            raise RuntimeError(
+                "Label cache identity mismatch. Refusing to bind cached Codex responses to "
+                "different pairs/prompts; use a new output directory."
+            )
+        return
+    if cached_responses:
+        raise RuntimeError(
+            "Legacy label responses exist without label_cache_identity.json. Refusing unsafe "
+            "reuse; use a new output directory."
+        )
+    temporary = identity_path.with_suffix(identity_path.suffix + ".new")
+    temporary.write_text(json.dumps(identity, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(identity_path)
 
 
 def build_batch_prompt(rows: List[dict]) -> str:
@@ -242,10 +309,15 @@ def main() -> None:
     prompts = list(iter_jsonl(args.prompts))
     if args.max_pairs is not None:
         prompts = prompts[: args.max_pairs]
+    bind_output_cache(out, build_cache_identity(args, prompts))
+    minimum_filtered = min(max(int(args.minimum_filtered_labels), 0), len(prompts))
 
     if shutil.which("codex") is None:
         write_jsonl(out / "manual_label_todo.jsonl", prompts)
-        print("codex command not found; wrote manual_label_todo.jsonl")
+        message = "codex command not found; wrote manual_label_todo.jsonl"
+        print(message)
+        if minimum_filtered > 0:
+            raise SystemExit(message)
         return
 
     all_labels = []
@@ -285,7 +357,6 @@ def main() -> None:
         all_labels.extend(response_labels(response_path))
 
     raw, filtered = merge_labels(prompts, all_labels, args.confidence_threshold)
-    minimum_filtered = min(max(int(args.minimum_filtered_labels), 0), len(prompts))
     existing_attempts = len(list(relabel_dir.glob("relabel_*_batch_*_stdout.jsonl")))
     while (
         len(filtered) < minimum_filtered
@@ -374,6 +445,12 @@ def main() -> None:
     }
     (out / "label_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     print(json.dumps(summary, indent=2, sort_keys=True))
+    if len(filtered) < minimum_filtered:
+        raise SystemExit(
+            f"Filtered-label gate failed after bounded relabeling: "
+            f"{len(filtered)}/{minimum_filtered}. Use a new label directory, add pairs, "
+            "or lower the explicit minimum; do not wait on the same cache forever."
+        )
 
 
 if __name__ == "__main__":

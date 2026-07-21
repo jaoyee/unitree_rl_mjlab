@@ -14,31 +14,79 @@ import numpy as np
 import torch
 from torch import nn
 
+from scripts.reinforcement_learning.rwm_trace.reference_summary import REFERENCE_FEATURE_NAMES
+from scripts.reinforcement_learning.rwm_trace.trajectory import GO2_COMMAND_MODES
+
 
 GO2_FEATURE_NAMES = (
-    "simulator_return",
-    "survival_length",
+    "simulator_return_per_step",
+    "survival_fraction",
     "terminal_flag",
     "reward_mean",
     "reward_std",
     "reward_min",
-    "reward_trend_slope",
+    "reward_trend_per_second",
     "action_norm_mean",
     "action_norm_std",
     "action_saturation_rate",
     "action_delta_norm_mean",
     "state_delta_norm_mean",
     "base_speed_mean",
+    "command_vx_mean",
+    "command_vy_mean",
+    "command_yaw_mean",
+    "command_linear_speed_mean",
+    "command_linear_active",
+    "command_yaw_active",
+    *(f"command_mode_{mode}" for mode in GO2_COMMAND_MODES),
+    "linear_velocity_projection_mean",
+    "linear_velocity_realization_ratio_mean",
+    "linear_velocity_realization_ratio_steady",
+    "yaw_velocity_realization_ratio_mean",
+    "yaw_velocity_realization_ratio_steady",
+    "command_direction_violation_rate",
+    "command_direction_correct_fraction",
+    "command_projected_velocity_window",
+    "command_displacement_realization_ratio",
+    "yaw_velocity_window",
+    "yaw_displacement_realization_ratio",
     "linear_tracking_error_mean",
+    "linear_tracking_error_steady",
     "yaw_tracking_error_mean",
+    "yaw_tracking_error_steady",
     "tilt_mean",
     "tilt_max",
     "joint_velocity_rms",
     "actuator_force_rms",
     "contact_fraction_mean",
     "contact_switch_rate",
+    "contact_fraction_rr",
+    "contact_fraction_rl",
+    "contact_switch_rate_rr",
+    "contact_switch_rate_rl",
+    "foot_swing_rate_fr",
+    "foot_swing_rate_fl",
+    "foot_swing_rate_rr",
+    "foot_swing_rate_rl",
+    "longest_stance_fraction_rr",
+    "longest_stance_fraction_rl",
+    "rear_duty_factor_abs_difference",
+    "rr_calf_relative_position_mean",
+    "base_velocity_window_x",
+    "base_velocity_window_y",
+    "base_height_mean",
+    "base_height_trend_per_second",
+    "foot_height_max_rr",
+    "foot_height_max_rl",
+    "foot_height_range_fr",
+    "foot_height_range_fl",
+    "foot_height_range_rr",
+    "foot_height_range_rl",
+    "foot_speed_mean_rr",
+    "foot_speed_mean_rl",
     "nonfinite_flag",
     "reset_reconstruction_error",
+    *REFERENCE_FEATURE_NAMES,
 )
 
 
@@ -64,7 +112,7 @@ class FeatureStats:
 class Go2TraceScorer(nn.Module):
     """Small MLP whose score difference parameterizes Bradley-Terry labels."""
 
-    def __init__(self, input_dim: int, hidden_dim: int = 256) -> None:
+    def __init__(self, input_dim: int, hidden_dim: int = 32) -> None:
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
@@ -134,7 +182,8 @@ def save_scorer_checkpoint(
 ) -> None:
     torch.save(
         {
-            "format_version": "go2_trace_scorer_v1",
+            "format_version": "go2_trace_scorer_v10_v1",
+            "feature_schema": "go2_trace_length_normalized_features_v10",
             "model_state_dict": model.state_dict(),
             "input_dim": len(stats.mean),
             "hidden_dim": int(hidden_dim),
@@ -150,8 +199,10 @@ def load_scorer_checkpoint(
     device: torch.device | str = "cpu",
 ) -> tuple[Go2TraceScorer, FeatureStats, dict[str, Any]]:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
-    if checkpoint.get("format_version") != "go2_trace_scorer_v1":
+    if checkpoint.get("format_version") != "go2_trace_scorer_v10_v1":
         raise ValueError(f"Not a Go2 TRACE scorer checkpoint: {path}")
+    if checkpoint.get("feature_schema") != "go2_trace_length_normalized_features_v10":
+        raise ValueError(f"TRACE scorer uses an incompatible feature schema: {path}")
     stats = FeatureStats.from_dict(checkpoint["feature_stats"])
     model = Go2TraceScorer(int(checkpoint["input_dim"]), int(checkpoint["hidden_dim"])).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])

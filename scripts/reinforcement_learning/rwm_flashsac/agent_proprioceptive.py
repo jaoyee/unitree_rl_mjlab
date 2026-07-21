@@ -14,6 +14,7 @@ from flash_rl.agents.flashSAC.agent import (
     _sample_flashsac_actions,
     _update_networks,
 )
+from flash_rl.agents.flashSAC.update_schedule import should_update_actor
 from flash_rl.types import NDArray, Tensor
 from scripts.reinforcement_learning.rwm_flashsac.world_model_env_proprioceptive import (
     proprioceptive_obs_t,
@@ -40,6 +41,7 @@ class FlashSACProprioceptiveAgent(FlashSACAgent):
             device=self._device,
         )
         actor_observations = proprioceptive_obs_t(observations)
+        self._ensure_action_noise_shape(actor_observations)
 
         with torch.no_grad():
             (
@@ -79,6 +81,11 @@ class FlashSACProprioceptiveAgent(FlashSACAgent):
             assert self.reward_normalizer is not None
             batch["reward"] = self.reward_normalizer.normalize_rewards(batch["reward"])
 
+        actor_update_enabled = should_update_actor(
+            update_step=self._update_step,
+            actor_learning_starts_updates=self._cfg.actor_learning_starts_updates,
+            actor_update_period=self._cfg.actor_update_period,
+        )
         update_info_raw = _update_networks(
             batch=batch,
             actor=self._actor,
@@ -86,7 +93,7 @@ class FlashSACProprioceptiveAgent(FlashSACAgent):
             target_critic=self._target_critic,
             temperature=self._temperature,
             cfg=self._cfg,
-            do_actor_update=(self._update_step % self._cfg.actor_update_period == 0),
+            do_actor_update=actor_update_enabled,
             device=self._device,
             grad_scaler=self._grad_scaler,
         )
@@ -99,6 +106,10 @@ class FlashSACProprioceptiveAgent(FlashSACAgent):
             elif not isinstance(value, dict):
                 update_info[key] = float(value)
         update_info["trace/replay_batch_fraction"] = float(trace_count / max(len(batch["reward"]), 1))
+        update_info["actor/update_enabled"] = float(actor_update_enabled)
+        update_info["actor/critic_warmup_remaining"] = float(
+            max(self._cfg.actor_learning_starts_updates - self._update_step, 0)
+        )
         return update_info
 
 

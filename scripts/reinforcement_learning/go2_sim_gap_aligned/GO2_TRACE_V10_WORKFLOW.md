@@ -1,6 +1,6 @@
 # Go2 TRACE V10
 
-Chinese detailed guide: [`GO2_TRACE_V10_WORKFLOW_zh.md`](GO2_TRACE_V10_WORKFLOW_zh.md)
+Chinese detailed guide: [`GO2_TRACE_V10_WORKFLOW_zh.md`](../../../GO2_TRACE_V10_WORKFLOW_zh.md)
 
 This directory contains the current Go2 TRACE implementation. V8/V9 run directories,
 label caches, scorer checkpoints, and replay shards are deliberately not part of V10.

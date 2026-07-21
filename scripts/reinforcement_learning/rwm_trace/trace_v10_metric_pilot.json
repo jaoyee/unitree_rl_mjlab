@@ -1,0 +1,28 @@
+{
+  "schema": "go2_trace_v10_metric_pilot_v1",
+  "base_protocol_sha256": "6953a4b42a7b994e9e7ab39dd0bda42044ea8c86851e27d066eff79970e5f262",
+  "selection": {
+    "scope": "global",
+    "selected_trajectory_count": 4096,
+    "tracking_weight": 0.70,
+    "stability_weight": 0.30,
+    "inactive_linear_scale": 0.05,
+    "inactive_yaw_scale": 0.05,
+    "sampling_strategy": "uniform_selected_replay"
+  },
+  "tracking": {
+    "linear_field": "linear_tracking_error_steady",
+    "yaw_field": "yaw_tracking_error_steady"
+  },
+  "stability": {
+    "cost_fields": [
+      "tilt_mean",
+      "tilt_max",
+      "roll_pitch_rate_rms",
+      "base_height_std"
+    ],
+    "quality_fields": [
+      "survival_fraction"
+    ]
+  }
+}

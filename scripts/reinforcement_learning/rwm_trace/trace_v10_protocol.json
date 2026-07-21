@@ -1,0 +1,104 @@
+{
+  "schema": "go2_trace_v10_protocol_v1",
+  "protocol_version": "go2_trace_v10",
+  "candidate": {
+    "action_temperature": 1.0,
+    "horizon": 100,
+    "source_start_count": 1024,
+    "trajectories_per_start": 16,
+    "candidate_trajectory_count": 16384,
+    "selected_trajectory_count": 4096,
+    "source_mode_counts": {
+      "stand": 82,
+      "pure_x": 256,
+      "pure_y": 103,
+      "pure_yaw": 82,
+      "xy": 143,
+      "x_yaw": 174,
+      "y_yaw": 51,
+      "xy_yaw": 133
+    },
+    "selected_mode_counts": {
+      "stand": 328,
+      "pure_x": 1024,
+      "pure_y": 410,
+      "pure_yaw": 328,
+      "xy": 573,
+      "x_yaw": 696,
+      "y_yaw": 205,
+      "xy_yaw": 532
+    },
+    "signed_magnitude_edges": {
+      "x": [0.05, 0.20, 0.35, 0.50],
+      "y": [0.03, 0.087, 0.143, 0.20],
+      "yaw": [0.05, 0.167, 0.283, 0.40]
+    },
+    "minimum_source_timestep": 32,
+    "selection_ratio": 0.25,
+    "selection_seed": 42,
+    "milp_time_limit_seconds": 300,
+    "milp_relative_gap": 0.0
+  },
+  "validity": {
+    "minimum_linear_realization_ratio": 0.10,
+    "minimum_yaw_realization_ratio": 0.10,
+    "minimum_linear_net_displacement": 0.001,
+    "minimum_yaw_net_change": 0.001,
+    "maximum_direction_violation_rate": 0.50,
+    "action_saturation_threshold": 0.95,
+    "maximum_saturation_fraction": 0.50,
+    "maximum_reset_reconstruction_error": 0.005,
+    "minimum_terminal_length": 20
+  },
+  "scorer": {
+    "initial_window_length": 40,
+    "initial_window_stride": 10,
+    "hidden_dimension": 32,
+    "initial_pair_pool_size": 800,
+    "minimum_pairs_per_partition_mode": 32,
+    "minimum_initial_filtered_labels": 600,
+    "minimum_initial_labels_per_partition_mode": 12,
+    "minimum_initial_labels_per_side": 3,
+    "confidence_threshold": 0.70,
+    "training_seeds": [42, 43, 44, 45, 46],
+    "minimum_global_balanced_accuracy": 0.60,
+    "minimum_mode_balanced_accuracy": 0.55,
+    "minimum_mode_validation_count": 12,
+    "refresh_query_budgets": [200, 160, 128, 102, 81, 65, 64, 64],
+    "refresh_pair_pool_multiplier": 2,
+    "minimum_refresh_labels_per_partition_mode": 4,
+    "minimum_refresh_labels_per_side": 1
+  },
+  "replay": {
+    "ratio": 0.10,
+    "primary_batch_size": 2048,
+    "trace_rows_per_batch": 205,
+    "retained_refreshes": 5,
+    "rwm_buffer_max_length": 10000000,
+    "n_step": 3,
+    "gamma": 0.99,
+    "terminal_reward_override": false,
+    "failure_backprop_steps": 0,
+    "failure_backprop_penalty": 0.0,
+    "action_saturation_penalty_scale": 0.0,
+    "action_delta_penalty_scale": 0.0
+  },
+  "training": {
+    "refresh_cycles": 8,
+    "environment_steps_per_refresh": 5000000,
+    "imagination_environments": 1024,
+    "updates_per_interaction_step": 2
+  },
+  "preflight": {
+    "maximum_selected_mean_any_joint_saturation": 0.35,
+    "maximum_selected_p95_any_joint_saturation": 0.50,
+    "maximum_selected_element_saturation": 0.05,
+    "maximum_mode_action_ood_fraction": 0.10
+  },
+  "pilot": {
+    "minimum_component_realization": 0.20,
+    "minimum_direction_correct_fraction": 0.60,
+    "maximum_tracking_error_degradation_fraction": 0.15,
+    "maximum_survival_drop": 0.10
+  }
+}

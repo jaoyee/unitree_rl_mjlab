@@ -1,0 +1,36 @@
+{
+  "schema": "go2_trace_v10_reward_v2_pilot_v1",
+  "base_protocol_sha256": "6953a4b42a7b994e9e7ab39dd0bda42044ea8c86851e27d066eff79970e5f262",
+  "side": "real",
+  "condition": "rr05",
+  "training": {
+    "environment_steps": 5000000,
+    "seed": 300,
+    "policy_resume_mode": "actor_only",
+    "load_replay_buffer": false,
+    "load_reward_normalizer": false
+  },
+  "evaluation": {
+    "seeds": [901, 902, 903],
+    "num_envs": 64,
+    "steps": 2400
+  },
+  "reward_v1": {
+    "version": "v1"
+  },
+  "reward_v2": {
+    "version": "v2_hierarchical",
+    "command_response_weight": 2.0,
+    "yaw_command_response_weight": 1.0,
+    "wrong_direction_weight": -2.0,
+    "uncertainty_penalty_weight": -2.0,
+    "action_rate_l2": -0.05,
+    "action_saturation": 0.0,
+    "action_saturation_threshold": 0.9,
+    "dof_acc_l2": -2.5e-7,
+    "dof_torques_l2": -2.5e-5,
+    "command_active_threshold": 0.02,
+    "motion_gate_low": 0.05,
+    "motion_gate_high": 0.30
+  }
+}

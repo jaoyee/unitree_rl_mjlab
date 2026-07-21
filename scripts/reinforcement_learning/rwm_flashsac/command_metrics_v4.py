@@ -35,6 +35,9 @@ def summarize_command_segments(
     command_sequence: Sequence[Sequence[float]],
     command_switch_steps: int,
     step_dt: float,
+    foot_contacts: np.ndarray | None = None,
+    foot_heights: np.ndarray | None = None,
+    foot_speeds: np.ndarray | None = None,
     settle_steps: int = 50,
     sustained_response_steps: int = 10,
     xy_error_threshold: float = 0.15,
@@ -79,6 +82,21 @@ def summarize_command_segments(
             raise ValueError(f"{name} must have shape {expected}, got {actual_shapes[name]}.")
     if actions.ndim != 3 or actions.shape[:2] != (steps, num_envs):
         raise ValueError(f"actions must be [steps, envs, action_dim], got {actions.shape}.")
+    gait_arrays = (foot_contacts, foot_heights, foot_speeds)
+    gait_available = all(value is not None for value in gait_arrays)
+    if any(value is not None for value in gait_arrays) and not gait_available:
+        raise ValueError("foot_contacts, foot_heights, and foot_speeds must be provided together.")
+    if gait_available:
+        foot_contacts = np.asarray(foot_contacts, dtype=bool)
+        foot_heights = np.asarray(foot_heights, dtype=np.float64)
+        foot_speeds = np.asarray(foot_speeds, dtype=np.float64)
+        for name, value in (
+            ("foot_contacts", foot_contacts),
+            ("foot_heights", foot_heights),
+            ("foot_speeds", foot_speeds),
+        ):
+            if value.ndim != 3 or value.shape[:2] != (steps, num_envs) or value.shape[2] != 4:
+                raise ValueError(f"{name} must be [steps, envs, 4], got {value.shape}.")
     if not command_sequence:
         return {}
     switch_steps = max(1, int(command_switch_steps))
@@ -142,6 +160,12 @@ def summarize_command_segments(
             expected_yaw_progress = 0.0
             yaw_pass = mean_abs_yaw_per_env <= stand_yaw_speed_threshold
 
+        direction_correct = np.ones((duration_steps, num_envs), dtype=bool)
+        if lin_active:
+            direction_correct &= projected_velocity > 0.0
+        if yaw_active:
+            direction_correct &= (velocity_yaw * yaw_command) > 0.0
+
         segment_terminated = terminated[start:stop].any(axis=0)
         segment_truncated = truncated[start:stop].any(axis=0)
         segment_pass = linear_pass & yaw_pass & ~segment_terminated
@@ -172,6 +196,24 @@ def summarize_command_segments(
         else:
             action_delta_mean = 0.0
 
+        effective_swing_fraction = np.full(num_envs, np.nan, dtype=np.float64)
+        no_effective_swing = np.full(num_envs, np.nan, dtype=np.float64)
+        if gait_available:
+            segment_contact = foot_contacts[active]
+            segment_height = foot_heights[active]
+            segment_speed = foot_speeds[active]
+            if duration_steps > 1:
+                lift_off = segment_contact[:-1] & ~segment_contact[1:]
+                touch_down = ~segment_contact[:-1] & segment_contact[1:]
+                contact_cycle = lift_off.any(axis=0) & touch_down.any(axis=0)
+            else:
+                contact_cycle = np.zeros((num_envs, 4), dtype=bool)
+            height_range = np.ptp(segment_height, axis=0)
+            speed_mean = segment_speed.mean(axis=0)
+            effective_feet = contact_cycle & (height_range >= 0.005) & (speed_mean >= 0.02)
+            effective_swing_fraction = effective_feet.mean(axis=1)
+            no_effective_swing = (effective_feet.sum(axis=1) == 0).astype(np.float64)
+
         valid_latency = latency_seconds[np.isfinite(latency_seconds)]
         per_command.append(
             {
@@ -183,7 +225,10 @@ def summarize_command_segments(
                 "mean_error_vel_xy": float(mean_xy_error_per_env.mean()),
                 "mean_error_vel_yaw": float(mean_yaw_error_per_env.mean()),
                 "linear_response_gain_mean": float(linear_gain_per_env.mean()),
+                "linear_response_gain_median": float(np.median(linear_gain_per_env)),
                 "yaw_response_gain_mean": float(yaw_gain_per_env.mean()),
+                "yaw_response_gain_median": float(np.median(yaw_gain_per_env)),
+                "direction_correct_fraction": float(direction_correct.mean()),
                 "body_frame_progress_mean": float(displacement_per_env.mean()),
                 "expected_body_frame_progress": float(expected_displacement),
                 "yaw_progress_mean": float(yaw_progress_per_env.mean()),
@@ -198,6 +243,12 @@ def summarize_command_segments(
                 "pass_rate": float(segment_pass.mean()),
                 "action_saturation_transition_rate": float(saturation.mean()),
                 "action_delta_abs_mean": action_delta_mean,
+                "effective_swing_foot_fraction_mean": (
+                    float(np.nanmean(effective_swing_fraction)) if gait_available else None
+                ),
+                "no_effective_swing_rate": (
+                    float(np.nanmean(no_effective_swing)) if gait_available else None
+                ),
             }
         )
 
@@ -206,6 +257,11 @@ def summarize_command_segments(
         index
         for index, command in enumerate(command_sequence[:segment_count])
         if np.linalg.norm(np.asarray(command, dtype=np.float64)) > 1.0e-6
+    ]
+    gait_entries = [
+        per_command[index]
+        for index in nonzero_indices
+        if per_command[index]["effective_swing_foot_fraction_mean"] is not None
     ]
     return {
         "per_command": per_command,
@@ -222,6 +278,16 @@ def summarize_command_segments(
         )
         if nonzero_indices
         else 0.0,
+        "mean_effective_swing_foot_fraction_nonstand": (
+            float(np.mean([entry["effective_swing_foot_fraction_mean"] for entry in gait_entries]))
+            if gait_entries
+            else None
+        ),
+        "mean_no_effective_swing_rate_nonstand": (
+            float(np.mean([entry["no_effective_swing_rate"] for entry in gait_entries]))
+            if gait_entries
+            else None
+        ),
         "thresholds": {
             "xy_error": float(xy_error_threshold),
             "yaw_error": float(yaw_error_threshold),

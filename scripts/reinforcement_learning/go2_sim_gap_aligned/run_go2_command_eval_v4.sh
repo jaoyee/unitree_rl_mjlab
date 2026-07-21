@@ -9,6 +9,7 @@ DEVICE="${DEVICE:-cuda:0}"
 NUM_ENVS="${NUM_ENVS:-128}"
 STEPS="${STEPS:-2400}"
 SEEDS="${SEEDS:-901 902 903}"
+MODES="${MODES:-clean calibrated}"
 
 case "${GAP_ID}" in
   g0) PAYLOAD=0.0; RR_STRENGTH=1.0 ;;
@@ -23,20 +24,21 @@ cd "${REPO}"
 mkdir -p "${OUTPUT_ROOT}"
 COMMANDS=(
   "0,0,0"
-  "0.5,0,0"
-  "-0.4,0,0"
-  "0,0.2,0"
-  "0,-0.2,0"
-  "0,0,0.4"
-  "0,0,-0.4"
-  "0.4,0.2,0.3"
+  "0.35,0,0"
+  "0,0.15,0"
+  "0,0,0.30"
+  "0.30,0.15,0"
+  "0.30,0,0.30"
+  "0,0.15,0.30"
+  "0.30,0.15,0.30"
 )
 COMMAND_ARGS=()
 for command in "${COMMANDS[@]}"; do
   COMMAND_ARGS+=("--command_sequence=${command}")
 done
 
-for mode in clean calibrated; do
+for mode in ${MODES}; do
+  case "${mode}" in clean|calibrated) ;; *) echo "Bad evaluation mode: ${mode}" >&2; exit 2 ;; esac
   for seed in ${SEEDS}; do
     output="${OUTPUT_ROOT}/${mode}_seed${seed}.json"
     [[ -s "${output}" ]] && continue
@@ -55,6 +57,7 @@ for mode in clean calibrated; do
       --num_envs "${NUM_ENVS}" --steps "${STEPS}" --seed "${seed}" \
       --payload_mass_kg "${PAYLOAD}" --rr_calf_strength "${RR_STRENGTH}" \
       --command_switch_steps 300 --command_settle_steps 50 \
+      --reset_between_commands \
       --sustained_response_steps 10 --xy_error_threshold 0.15 \
       --yaw_error_threshold 0.15 --minimum_response_gain 0.50 \
       --maximum_response_gain 1.50 --no_response_gain 0.20 \

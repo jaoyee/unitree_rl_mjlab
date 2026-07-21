@@ -238,8 +238,34 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Optional offline dataset whose 45D states initialize fixed-length imperfect-simulator rollouts.",
     )
+    parser.add_argument(
+        "--trace_min_source_timestep",
+        type=int,
+        default=0,
+        help=(
+            "Only sample TRACE reset rows whose source-dataset timestep is at least this value. "
+            "Set to 1 to exclude episode-boundary rows with potentially stale simulator auxiliary state."
+        ),
+    )
+    parser.add_argument(
+        "--trace_source_history_horizon",
+        type=int,
+        default=1,
+        help=(
+            "Require this many contiguous rows from the same source episode, ending at each "
+            "sampled TRACE reset row. Set this to the frozen RWM history horizon."
+        ),
+    )
     parser.add_argument("--trace_rollout_length", type=int, default=20)
     parser.add_argument("--trace_trajectories_per_state", type=int, default=4)
+    parser.add_argument(
+        "--trace_source_ids_path",
+        default=None,
+        help=(
+            "Optional torch/JSON file containing exact flattened source-dataset row IDs. "
+            "Used to append rollout branches only for start states that failed capacity validation."
+        ),
+    )
     parser.add_argument(
         "--trace_reset_mode",
         choices=("exact_snapshot", "canonical_real_projection"),
@@ -260,6 +286,15 @@ def _parse_args() -> argparse.Namespace:
         type=float,
         default=1.0e-4,
         help="Maximum repeated one-step state error allowed after restoring the same snapshot/action.",
+    )
+    parser.add_argument(
+        "--trace_require_source_transition_identity",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Require the reset simulator to reproduce the source dataset next-state under the source action. "
+            "Disable only when the source dataset and imperfect simulator intentionally use different dynamics."
+        ),
     )
     parser.add_argument(
         "--trace_action_temperature",
@@ -461,6 +496,72 @@ def _sample_commands_for_modes(
 
 def _sample_mode_ids(weights: torch.Tensor, num_envs: int) -> torch.Tensor:
     return torch.multinomial(weights, num_envs, replacement=True)
+
+
+def _command_mode_name(command: torch.Tensor, epsilon: float = 1.0e-6) -> str:
+    active = tuple(bool(abs(float(value)) > epsilon) for value in command[:3])
+    return {
+        (False, False, False): "stand",
+        (True, False, False): "pure_x",
+        (False, True, False): "pure_y",
+        (False, False, True): "pure_yaw",
+        (True, True, False): "xy",
+        (True, False, True): "x_yaw",
+        (False, True, True): "y_yaw",
+        (True, True, True): "xy_yaw",
+    }[active]
+
+
+def _largest_remainder_counts(weights: torch.Tensor, total: int) -> list[int]:
+    raw = weights.detach().cpu().double() * int(total)
+    counts = torch.floor(raw).long()
+    remainder = int(total) - int(counts.sum())
+    if remainder:
+        order = torch.argsort(raw - counts.double(), descending=True, stable=True)
+        counts[order[:remainder]] += 1
+    return [int(value) for value in counts]
+
+
+def _stratified_trace_source_ids(
+    eligible_ids: torch.Tensor,
+    source_commands: torch.Tensor,
+    modes: list[CommandMode],
+    mode_weights: torch.Tensor,
+    num_unique: int,
+    generator: torch.Generator,
+) -> tuple[torch.Tensor, dict[str, int]]:
+    """Sample reset rows with an exact largest-remainder command-mode allocation."""
+
+    target_counts = _largest_remainder_counts(mode_weights, num_unique)
+    eligible_commands = source_commands[eligible_ids]
+    eligible_mode_names = [_command_mode_name(command) for command in eligible_commands]
+    selected_parts: list[torch.Tensor] = []
+    selected_counts: dict[str, int] = {}
+    for mode, target in zip(modes, target_counts, strict=True):
+        if target == 0:
+            selected_counts[mode.name] = 0
+            continue
+        local_ids = torch.tensor(
+            [index for index, name in enumerate(eligible_mode_names) if name == mode.name],
+            dtype=torch.long,
+        )
+        if local_ids.numel() == 0:
+            raise ValueError(
+                f"TRACE source dataset has no eligible rows for required command mode {mode.name!r}."
+            )
+        if local_ids.numel() >= target:
+            sampled_local = local_ids[torch.randperm(local_ids.numel(), generator=generator)[:target]]
+        else:
+            sampled_local = local_ids[
+                torch.randint(local_ids.numel(), (target,), generator=generator)
+            ]
+        selected_parts.append(eligible_ids[sampled_local])
+        selected_counts[mode.name] = target
+    selected = torch.cat(selected_parts)
+    selected = selected[torch.randperm(selected.numel(), generator=generator)]
+    if selected.numel() != num_unique:
+        raise RuntimeError(f"TRACE stratified sampler produced {selected.numel()} rows, expected {num_unique}.")
+    return selected, selected_counts
 
 
 def _force_commands(env: Any, commands: torch.Tensor) -> None:
@@ -824,6 +925,27 @@ def _episode_domain_rows(
     }
 
 
+def _trace_scorer_diagnostics(env: Any) -> dict[str, torch.Tensor]:
+    """Capture simulator-only kinematics used by the TRACE scorer."""
+
+    base_env = env.unwrapped
+    robot = base_env.scene["robot"]
+    site_names = list(robot.site_names)
+    missing = [name for name in ("FR", "FL", "RR", "RL") if name not in site_names]
+    if missing:
+        raise RuntimeError(f"Go2 TRACE diagnostics cannot resolve foot sites: {missing}")
+    foot_ids = torch.tensor(
+        [site_names.index(name) for name in ("FR", "FL", "RR", "RL")],
+        device=base_env.device,
+        dtype=torch.long,
+    )
+    return {
+        "base_position_w": robot.data.root_link_pos_w.clone(),
+        "foot_position_w": robot.data.site_pos_w[:, foot_ids].clone(),
+        "foot_velocity_w": robot.data.site_lin_vel_w[:, foot_ids].clone(),
+    }
+
+
 def _append_table_chunks(
     chunks: dict[str, list[torch.Tensor]],
     rows: dict[str, torch.Tensor],
@@ -858,6 +980,16 @@ def main() -> None:
         raise ValueError(
             "TRACE imperfect-simulator action temperature must be finite and greater than zero, "
             f"got {args.trace_action_temperature}."
+        )
+    if int(args.trace_min_source_timestep) < 0:
+        raise ValueError(
+            "TRACE minimum source timestep must be non-negative, "
+            f"got {args.trace_min_source_timestep}."
+        )
+    if int(args.trace_source_history_horizon) < 1:
+        raise ValueError(
+            "TRACE source history horizon must be positive, "
+            f"got {args.trace_source_history_horizon}."
         )
     device = select_device(args.device)
     set_seed(int(args.seed))
@@ -914,12 +1046,15 @@ def main() -> None:
     trace_source_previous_actions: torch.Tensor | None = None
     trace_source_actions: torch.Tensor | None = None
     trace_source_snapshot: dict[str, Any] | None = None
+    trace_source_eligible_count: int | None = None
+    trace_source_mode_counts: dict[str, int] | None = None
     if args.trace_reset_dataset:
         if int(args.trace_rollout_length) < 1 or int(args.trace_trajectories_per_state) < 1:
             raise ValueError("TRACE rollout length and trajectories per state must be positive.")
         trace_source_path = resolve_repo_path(str(args.trace_reset_dataset))
         trace_source_dataset = torch.load(trace_source_path, map_location="cpu", weights_only=False)
-        source_states = stack_time_key(trace_source_dataset, "states").reshape(-1, int(dims.state_dim)).float()
+        source_states_grid = stack_time_key(trace_source_dataset, "states").float()
+        source_states = source_states_grid.reshape(-1, int(dims.state_dim))
         source_next_states = stack_time_key(trace_source_dataset, "next_states").reshape(
             -1, int(dims.state_dim)
         ).float()
@@ -927,18 +1062,94 @@ def main() -> None:
             raise ValueError(f"TRACE reset dataset must contain 45D states, got {source_states.shape[-1]}.")
         if len(source_next_states) != len(source_states):
             raise ValueError("TRACE source states and next_states must have identical flattened lengths.")
+        source_timesteps_grid = stack_time_key(trace_source_dataset, "timesteps").long()
+        source_episode_ids_grid = stack_time_key(trace_source_dataset, "episode_ids").long()
+        if source_timesteps_grid.ndim == 3 and source_timesteps_grid.shape[-1] == 1:
+            source_timesteps_grid = source_timesteps_grid.squeeze(-1)
+        if source_episode_ids_grid.ndim == 3 and source_episode_ids_grid.shape[-1] == 1:
+            source_episode_ids_grid = source_episode_ids_grid.squeeze(-1)
+        expected_source_shape = tuple(source_states_grid.shape[:2])
+        if tuple(source_timesteps_grid.shape) != expected_source_shape:
+            raise ValueError("TRACE source timesteps and states must have identical flattened lengths.")
+        if tuple(source_episode_ids_grid.shape) != expected_source_shape:
+            raise ValueError("TRACE source episode_ids and states must have identical time/env shapes.")
+        source_timesteps = source_timesteps_grid.reshape(-1)
+        history_horizon = int(args.trace_source_history_horizon)
+        eligible_mask = source_timesteps_grid >= int(args.trace_min_source_timestep)
+        if history_horizon > 1:
+            eligible_mask[: history_horizon - 1] = False
+            current_start = history_horizon - 1
+            current_episode = source_episode_ids_grid[current_start:]
+            current_timestep = source_timesteps_grid[current_start:]
+            for offset in range(1, history_horizon):
+                previous_episode = source_episode_ids_grid[
+                    current_start - offset : -offset
+                ]
+                previous_timestep = source_timesteps_grid[
+                    current_start - offset : -offset
+                ]
+                eligible_mask[current_start:] &= current_episode == previous_episode
+                eligible_mask[current_start:] &= current_timestep == previous_timestep + offset
+        eligible_ids = torch.nonzero(eligible_mask.reshape(-1), as_tuple=False).flatten()
+        trace_source_eligible_count = int(eligible_ids.numel())
+        if trace_source_eligible_count == 0:
+            raise ValueError(
+                "TRACE reset dataset has no rows satisfying "
+                f"timestep >= {args.trace_min_source_timestep} with "
+                f"{history_horizon} contiguous source rows."
+            )
+        source_commands = stack_time_key(trace_source_dataset, "commands").reshape(-1, 3).float()
+        if len(source_commands) != len(source_states):
+            raise ValueError("TRACE source commands and states must have identical flattened lengths.")
+        modes = _parse_modes(str(args.command_modes))
+        source_mode_weights = _parse_mode_weights(args.command_mode_weights, modes, "cpu")
         num_unique = int(np.ceil(int(args.num_envs) / int(args.trace_trajectories_per_state)))
-        generator = torch.Generator(device="cpu").manual_seed(int(args.seed) + 1701)
-        if len(source_states) >= num_unique:
-            selected_ids = torch.randperm(len(source_states), generator=generator)[:num_unique]
+        if args.trace_source_ids_path:
+            source_ids_path = Path(args.trace_source_ids_path).expanduser().resolve()
+            if source_ids_path.suffix.lower() == ".json":
+                import json
+
+                selected_ids = torch.as_tensor(
+                    json.loads(source_ids_path.read_text(encoding="utf-8")),
+                    dtype=torch.long,
+                ).reshape(-1)
+            else:
+                loaded_ids = torch.load(source_ids_path, map_location="cpu", weights_only=False)
+                if isinstance(loaded_ids, dict):
+                    loaded_ids = loaded_ids.get("source_ids", loaded_ids.get("trace_start_state_ids"))
+                selected_ids = torch.as_tensor(loaded_ids, dtype=torch.long).reshape(-1)
+            if selected_ids.numel() != num_unique:
+                raise ValueError(
+                    "Explicit TRACE source ID count does not match num_envs / branches: "
+                    f"ids={selected_ids.numel()}, expected={num_unique}."
+                )
+            if selected_ids.unique().numel() != selected_ids.numel():
+                raise ValueError("Explicit TRACE source IDs must be unique.")
+            if bool((selected_ids < 0).any()) or bool((selected_ids >= len(source_states)).any()):
+                raise ValueError("Explicit TRACE source IDs contain an out-of-range row.")
+            if not bool(eligible_mask.reshape(-1)[selected_ids].all()):
+                raise ValueError(
+                    "Explicit TRACE source IDs include rows without the required contiguous history."
+                )
+            trace_source_mode_counts = {mode.name: 0 for mode in modes}
+            for source_id in selected_ids.tolist():
+                name = _command_mode_name(source_commands[int(source_id)])
+                trace_source_mode_counts[name] = trace_source_mode_counts.get(name, 0) + 1
         else:
-            selected_ids = torch.randint(len(source_states), (num_unique,), generator=generator)
+            generator = torch.Generator(device="cpu").manual_seed(int(args.seed) + 1701)
+            selected_ids, trace_source_mode_counts = _stratified_trace_source_ids(
+                eligible_ids,
+                source_commands,
+                modes,
+                source_mode_weights,
+                num_unique,
+                generator,
+            )
         trace_start_state_ids = selected_ids.repeat_interleave(int(args.trace_trajectories_per_state))[
             : int(args.num_envs)
         ]
         trace_source_states = source_states[trace_start_state_ids].to(env.device)
         trace_source_next_states = source_next_states[trace_start_state_ids].to(env.device)
-        source_commands = stack_time_key(trace_source_dataset, "commands").reshape(-1, 3).float()
         source_previous_actions = stack_time_key(trace_source_dataset, "prev_actions").reshape(
             -1, action_dim
         ).float()
@@ -1094,6 +1305,11 @@ def main() -> None:
         "trace_candidates": {
             "enabled": trace_source_states is not None,
             "reset_dataset": None if args.trace_reset_dataset is None else str(args.trace_reset_dataset),
+            "minimum_source_timestep": int(args.trace_min_source_timestep),
+            "source_history_horizon": int(args.trace_source_history_horizon),
+            "eligible_source_rows": trace_source_eligible_count,
+            "selected_unique_source_mode_counts": trace_source_mode_counts,
+            "source_sampling": "exact_largest_remainder_by_command_mode",
             "rollout_length": int(args.trace_rollout_length),
             "trajectories_per_state": int(args.trace_trajectories_per_state),
             "action_temperature": (
@@ -1244,7 +1460,10 @@ def main() -> None:
         ).values
         source_next_max_error = float(source_next_error.max())
         source_match_available = args.trace_reset_mode == "exact_snapshot"
-        if source_match_available and source_next_max_error > float(args.trace_identity_tolerance):
+        source_match_required = bool(
+            source_match_available and args.trace_require_source_transition_identity
+        )
+        if source_match_required and source_next_max_error > float(args.trace_identity_tolerance):
             raise RuntimeError(
                 "TRACE exact reset failed the dataset transition identity check: "
                 f"sim(snapshot, source_action) differs from dataset next_state by "
@@ -1261,7 +1480,13 @@ def main() -> None:
             "available": bool(source_match_available),
             "max_state_abs_error": source_next_max_error if source_match_available else None,
             "tolerance": float(args.trace_identity_tolerance) if source_match_available else None,
-            "passed": True if source_match_available else None,
+            "required": source_match_required,
+            "passed": (
+                source_next_max_error <= float(args.trace_identity_tolerance)
+                if source_match_available
+                else None
+            ),
+            "mismatch_expected": bool(source_match_available and not source_match_required),
             "unavailable_reason": (
                 None
                 if source_match_available
@@ -1426,6 +1651,11 @@ def main() -> None:
         next_state = extractor.extract_state()
         contact = extractor.extract_contact()
         termination = extractor.extract_termination()
+        trace_diagnostics = (
+            _trace_scorer_diagnostics(env)
+            if trace_source_states is not None
+            else None
+        )
         done = terminateds | truncateds
         if trace_source_states is not None:
             done = done & trace_active
@@ -1542,6 +1772,7 @@ def main() -> None:
             collector_type=transition_collector_ids,
             trace_reset_reconstruction_error=trace_reset_error,
             trace_valid_mask=transition_valid_mask,
+            trace_diagnostics=trace_diagnostics,
             simulator_snapshot=transition_simulator_snapshot,
         )
         flush_part(force=False)

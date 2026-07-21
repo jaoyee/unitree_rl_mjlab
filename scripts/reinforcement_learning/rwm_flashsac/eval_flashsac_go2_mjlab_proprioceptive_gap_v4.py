@@ -73,6 +73,12 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--command_switch_steps", type=int, default=300)
+    parser.add_argument(
+        "--reset_between_commands",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Reset all environments at every command boundary so command modes are evaluated independently.",
+    )
     parser.add_argument("--command_settle_steps", type=int, default=50)
     parser.add_argument("--sustained_response_steps", type=int, default=10)
     parser.add_argument("--xy_error_threshold", type=float, default=0.15)
@@ -326,6 +332,13 @@ def main() -> None:
     initial_command = command_sequence[0] if command_sequence else fixed_command
 
     env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
+    robot = env.scene["robot"]
+    site_names = list(robot.site_names)
+    foot_ids = torch.tensor(
+        [site_names.index(name) for name in ("FR", "FL", "RR", "RL")],
+        device=device,
+        dtype=torch.long,
+    )
     _force_fixed_command(env, initial_command)
     full_actor_dim = int(env.single_observation_space.spaces["actor"].shape[0])
     full_action_dim = int(env.single_action_space.shape[0])
@@ -372,6 +385,9 @@ def main() -> None:
     estimator_confidence_samples: list[np.ndarray] = []
     estimator_per_foot_samples: list[np.ndarray] = []
     estimator_contact_samples: list[np.ndarray] = []
+    foot_contact_samples: list[np.ndarray] = []
+    foot_height_samples: list[np.ndarray] = []
+    foot_speed_samples: list[np.ndarray] = []
 
     print(f"[Go2-FlashSAC-RWM-Proprioceptive-Eval] checkpoint={checkpoint_path}")
     print(
@@ -402,6 +418,14 @@ def main() -> None:
 
     with torch.no_grad():
         for _step in range(args.steps):
+            if (
+                args.reset_between_commands
+                and command_sequence
+                and _step > 0
+                and _step % max(1, args.command_switch_steps) == 0
+            ):
+                obs_dict, _ = env.reset()
+                full_observations = _actor_obs(obs_dict)
             current_command = (
                 command_sequence[(_step // max(1, args.command_switch_steps)) % len(command_sequence)]
                 if command_sequence
@@ -429,13 +453,22 @@ def main() -> None:
             base_lin_vel_samples.append(full_observations[:, 0:3].copy())
             base_ang_vel_samples.append(full_observations[:, 3:6].copy())
             command_samples.append(full_observations[:, 9:12].copy())
+            contact_data = env.scene["feet_ground_contact"].data.found
+            contact = (
+                torch.zeros(args.num_envs, 4, device=device)
+                if contact_data is None
+                else (contact_data > 0).float()
+            )
+            foot_contact_samples.append(contact.detach().cpu().numpy().astype(bool))
+            foot_height_samples.append(
+                robot.data.site_pos_w[:, foot_ids, 2].detach().cpu().numpy().astype(np.float32)
+            )
+            foot_speed_samples.append(
+                torch.linalg.vector_norm(robot.data.site_lin_vel_w[:, foot_ids], dim=-1)
+                .detach().cpu().numpy().astype(np.float32)
+            )
             if args.validate_contact_velocity_estimator:
                 robot_data = env.scene["robot"].data
-                contact_data = env.scene["feet_ground_contact"].data.found
-                if contact_data is None:
-                    contact = torch.zeros(args.num_envs, 4, device=device)
-                else:
-                    contact = (contact_data > 0).float()
                 estimated_velocity, confidence, per_foot_velocity = estimate_go2_base_lin_vel_b(
                     robot_data.joint_pos,
                     robot_data.joint_vel,
@@ -506,6 +539,9 @@ def main() -> None:
             terminated=np.stack(terminated_samples, axis=0),
             truncated=np.stack(truncated_samples, axis=0),
             actions=np.stack(action_samples, axis=0),
+            foot_contacts=np.stack(foot_contact_samples, axis=0),
+            foot_heights=np.stack(foot_height_samples, axis=0),
+            foot_speeds=np.stack(foot_speed_samples, axis=0),
             command_sequence=command_sequence,
             command_switch_steps=args.command_switch_steps,
             step_dt=step_dt,

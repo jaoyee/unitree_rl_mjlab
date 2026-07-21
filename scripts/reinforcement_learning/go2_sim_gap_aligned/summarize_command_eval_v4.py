@@ -50,6 +50,31 @@ def main() -> None:
                     "action_saturation_rate_mean": float(
                         np.mean([entry["action_saturation_transition_rate"] for entry in entries])
                     ),
+                    "linear_response_gain_mean": float(
+                        np.mean([entry["linear_response_gain_mean"] for entry in entries])
+                    ),
+                    "linear_response_gain_median_mean": float(
+                        np.mean([entry["linear_response_gain_median"] for entry in entries])
+                    ),
+                    "yaw_response_gain_mean": float(
+                        np.mean([entry["yaw_response_gain_mean"] for entry in entries])
+                    ),
+                    "yaw_response_gain_median_mean": float(
+                        np.mean([entry["yaw_response_gain_median"] for entry in entries])
+                    ),
+                    "direction_correct_fraction_mean": float(
+                        np.mean([entry["direction_correct_fraction"] for entry in entries])
+                    ),
+                    "effective_swing_foot_fraction_mean": (
+                        float(np.mean([entry["effective_swing_foot_fraction_mean"] for entry in entries]))
+                        if entries[0].get("effective_swing_foot_fraction_mean") is not None
+                        else None
+                    ),
+                    "no_effective_swing_rate_mean": (
+                        float(np.mean([entry["no_effective_swing_rate"] for entry in entries]))
+                        if entries[0].get("no_effective_swing_rate") is not None
+                        else None
+                    ),
                 }
             )
         aggregate = [payload["command_metrics_v4"] for payload in payloads]
@@ -64,8 +89,21 @@ def main() -> None:
             "all_commands_pass_rate_mean": float(
                 np.mean([entry["all_commands_pass_rate"] for entry in aggregate])
             ),
+            "all_nonzero_commands_pass_rate_mean": float(
+                np.mean([entry["all_nonzero_commands_pass_rate"] for entry in aggregate])
+            ),
             "mean_no_response_rate": float(
                 np.mean([entry["mean_no_response_rate"] for entry in aggregate])
+            ),
+            "mean_effective_swing_foot_fraction_nonstand": (
+                float(np.mean([entry["mean_effective_swing_foot_fraction_nonstand"] for entry in aggregate]))
+                if aggregate[0].get("mean_effective_swing_foot_fraction_nonstand") is not None
+                else None
+            ),
+            "mean_no_effective_swing_rate_nonstand": (
+                float(np.mean([entry["mean_no_effective_swing_rate_nonstand"] for entry in aggregate]))
+                if aggregate[0].get("mean_no_effective_swing_rate_nonstand") is not None
+                else None
             ),
             "per_command": per_command,
         }

@@ -108,6 +108,11 @@ class Go2MixedDatasetBuilder:
         if bool((metadata.get("trace_candidates") or {}).get("enabled", False)):
             self.data["trace_reset_reconstruction_errors"] = []
             self.data["trace_valid_masks"] = []
+            # Privileged simulator diagnostics are scorer-only. They are not
+            # part of the policy observation or the learned RWM state.
+            self.data["trace_base_positions_w"] = []
+            self.data["trace_foot_positions_w"] = []
+            self.data["trace_foot_velocities_w"] = []
         if bool(metadata.get("save_trace_snapshots", False)):
             for key in (
                 "sim_root_states_local",
@@ -152,6 +157,7 @@ class Go2MixedDatasetBuilder:
         noisy_actor_observation: torch.Tensor | None = None,
         trace_reset_reconstruction_error: torch.Tensor | None = None,
         trace_valid_mask: torch.Tensor | None = None,
+        trace_diagnostics: dict[str, torch.Tensor] | None = None,
         simulator_snapshot: dict[str, torch.Tensor] | None = None,
     ) -> None:
         self.data["observations"].append(_detach_cpu(obs, torch.float32))
@@ -197,6 +203,20 @@ class Go2MixedDatasetBuilder:
             if trace_valid_mask is None:
                 trace_valid_mask = torch.ones(num_envs, device=action.device, dtype=torch.bool)
             self.data["trace_valid_masks"].append(_detach_cpu(trace_valid_mask, torch.bool))
+            if trace_diagnostics is None:
+                raise ValueError("TRACE candidates require scorer diagnostics on every add().")
+            diagnostic_mapping = {
+                "trace_base_positions_w": "base_position_w",
+                "trace_foot_positions_w": "foot_position_w",
+                "trace_foot_velocities_w": "foot_velocity_w",
+            }
+            missing = [source for source in diagnostic_mapping.values() if source not in trace_diagnostics]
+            if missing:
+                raise ValueError(f"trace_diagnostics is missing keys: {missing}")
+            for output_key, source_key in diagnostic_mapping.items():
+                self.data[output_key].append(
+                    _detach_cpu(trace_diagnostics[source_key], torch.float32)
+                )
         if "sim_root_states_local" in self.data:
             if simulator_snapshot is None:
                 raise ValueError("save_trace_snapshots=True requires simulator_snapshot on every add().")

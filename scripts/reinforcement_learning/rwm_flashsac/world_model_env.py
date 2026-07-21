@@ -75,6 +75,21 @@ class FlashSACWorldModelEnvConfig:
     ang_vel_z_max: float = 1.0
     rel_standing_envs: float = 0.05
     uncertainty_penalty_weight: float = -1.0
+    reward_version: str = "v1"
+    reward_command_response_weight: float = 2.0
+    reward_yaw_command_response_weight: float = 1.0
+    reward_wrong_direction_weight: float = -2.0
+    reward_response_shortfall_weight: float = -6.0
+    reward_response_floor: float = 0.30
+    reward_active_command_bias: float = -0.20
+    reward_action_rate_l2: float = -0.05
+    reward_action_saturation: float = 0.0
+    reward_action_saturation_threshold: float = 0.9
+    reward_dof_acc_l2: float = -2.5e-7
+    reward_dof_torques_l2: float = -2.5e-5
+    reward_command_active_threshold: float = 0.02
+    reward_motion_gate_low: float = 0.05
+    reward_motion_gate_high: float = 0.30
     policy_action_mask_indices: tuple[int, ...] = ()
     world_model_action_mask_indices: tuple[int, ...] = ()
     policy_observation_mask_indices: tuple[int, ...] = ()
@@ -189,8 +204,23 @@ class Go2RWMFlashSACWorldModelEnv(VectorEnv):
             action_dim=self._full_action_dim,
             device=self._device,
             step_dt=cfg.step_dt,
+            reward_version=cfg.reward_version,
         )
         self.reward_state.weights.uncertainty = cfg.uncertainty_penalty_weight
+        self.reward_state.weights.command_response = cfg.reward_command_response_weight
+        self.reward_state.weights.yaw_command_response = cfg.reward_yaw_command_response_weight
+        self.reward_state.weights.wrong_direction = cfg.reward_wrong_direction_weight
+        self.reward_state.weights.response_shortfall = cfg.reward_response_shortfall_weight
+        self.reward_state.weights.response_floor = cfg.reward_response_floor
+        self.reward_state.weights.active_command_bias = cfg.reward_active_command_bias
+        self.reward_state.weights.action_rate_l2 = cfg.reward_action_rate_l2
+        self.reward_state.weights.action_saturation = cfg.reward_action_saturation
+        self.reward_state.weights.action_saturation_threshold = cfg.reward_action_saturation_threshold
+        self.reward_state.weights.dof_acc_l2 = cfg.reward_dof_acc_l2
+        self.reward_state.weights.dof_torques_l2 = cfg.reward_dof_torques_l2
+        self.reward_state.command_active_threshold = cfg.reward_command_active_threshold
+        self.reward_state.motion_gate_low = cfg.reward_motion_gate_low
+        self.reward_state.motion_gate_high = cfg.reward_motion_gate_high
         self._ep_returns = torch.zeros(self.num_envs, device=self._device)
         self._ep_lengths = torch.zeros(self.num_envs, dtype=torch.long, device=self._device)
         self._reward_buffer: deque[float] = deque(maxlen=100)

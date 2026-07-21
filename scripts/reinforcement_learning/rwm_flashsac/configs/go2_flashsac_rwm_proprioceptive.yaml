@@ -28,6 +28,21 @@ world_model:
   max_episode_length: 1000
   step_dt: 0.02
   uncertainty_penalty_weight: -2.0
+  reward_version: v1
+  reward_command_response_weight: 2.0
+  reward_yaw_command_response_weight: 1.0
+  reward_wrong_direction_weight: -2.0
+  reward_response_shortfall_weight: -6.0
+  reward_response_floor: 0.30
+  reward_active_command_bias: -0.20
+  reward_action_rate_l2: -0.05
+  reward_action_saturation: 0.0
+  reward_action_saturation_threshold: 0.9
+  reward_dof_acc_l2: -2.5e-7
+  reward_dof_torques_l2: -2.5e-5
+  reward_command_active_threshold: 0.02
+  reward_motion_gate_low: 0.05
+  reward_motion_gate_high: 0.30
   command_resample_interval_min: 150
   command_resample_interval_max: 400
   lin_vel_x_min: -0.3
@@ -77,6 +92,7 @@ agent:
   actor_noise_zeta_mu: 2.0
   actor_noise_zeta_max: 16
   actor_update_period: 2
+  actor_learning_starts_updates: 0
   critic_num_blocks: 2
   critic_hidden_dim: 256
   critic_num_bins: 101

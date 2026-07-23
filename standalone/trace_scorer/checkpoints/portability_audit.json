@@ -1,0 +1,74 @@
+{
+  "baseline_dependencies": {
+    "actor": false,
+    "critic": false,
+    "replay_builder": false,
+    "reward_function": false,
+    "rwm_checkpoint": false
+  },
+  "builder_handoff_source": "portable_trace_selection_v1",
+  "candidate_dataset_sha256": "aa2bdd04216ec1c248437ca230d8e1886f37120fedb3ac0e5daa742b330cabde",
+  "max_score_abs_error": 0.0,
+  "portable_import_violations": {},
+  "portable_source_imports": {
+    "__init__.py": [
+      "core"
+    ],
+    "attach_scores.py": [
+      "__future__",
+      "argparse",
+      "json",
+      "os",
+      "pathlib",
+      "sys",
+      "trace_scorer.core"
+    ],
+    "core.py": [
+      "__future__",
+      "dataclasses",
+      "hashlib",
+      "numpy",
+      "pathlib",
+      "torch",
+      "typing"
+    ],
+    "export_bundle.py": [
+      "__future__",
+      "argparse",
+      "json",
+      "pathlib",
+      "shutil",
+      "sys",
+      "trace_scorer.core"
+    ],
+    "export_selection_manifest.py": [
+      "__future__",
+      "argparse",
+      "json",
+      "numpy",
+      "os",
+      "pathlib",
+      "sys",
+      "trace_scorer.core"
+    ],
+    "score_candidates.py": [
+      "__future__",
+      "argparse",
+      "json",
+      "numpy",
+      "os",
+      "pathlib",
+      "sys",
+      "trace_scorer.core"
+    ]
+  },
+  "reward_features_rejected": true,
+  "schema": "portable_trace_scorer_audit_v1",
+  "score_manifest_sha256": "a171fde3ec913d4bece57c2105f32797842524b1a42adee32eb81028c18f7364",
+  "scorer_sha256": "61df74670b5cef66c11ad76ab4fb95ccaf65607fe130c9e82abe4b88e16e8e34",
+  "selected_count": 1024,
+  "selection_indices_exact_match": true,
+  "selection_manifest_sha256": "3be829006dd427da17a5504cedf65025cdc56b2afffb4b2c8e035bd0b205f455",
+  "status": "PASS",
+  "summaries_sha256": "9e888f69238bfc8e0d6d28b1161b63ca79b3b867df5722a4615537af4637fd3b"
+}

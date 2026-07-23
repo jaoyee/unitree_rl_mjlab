@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trace-core"
+version = "0.1.0"
+description = "Baseline-agnostic TRACE orchestration and adapter contracts"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+trace-run = "trace_core.run_pipeline:main"
+trace-annotate-eligibility = "trace_core.annotate_eligibility:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["trace_core*"]

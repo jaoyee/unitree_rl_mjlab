@@ -1,0 +1,21 @@
+{
+  "schema": "trace_baseline_adapter_v1",
+  "name": "replace_with_confirmed_baseline",
+  "setting": "sim",
+  "source_dataset": "/absolute/path/to/source_dataset.pt",
+  "rollout_actor_checkpoint": "/absolute/path/to/checkpoint",
+  "reward_config": "/absolute/path/to/baseline_reward_config.yaml",
+  "world_model_checkpoint": "/absolute/path/to/world_model.pt",
+  "training": {
+    "initial_checkpoint": null,
+    "command": [
+      "bash",
+      "/absolute/path/to/baseline_training_entrypoint.sh"
+    ],
+    "environment": {
+      "DATASET_PATH": "{source_dataset}",
+      "MODEL_PATH": "{world_model_checkpoint}",
+      "OUTPUT_DIR": "{output_root}"
+    }
+  }
+}

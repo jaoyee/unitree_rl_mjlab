@@ -11,13 +11,17 @@
   "refresh_cycle": 1,
   "seed": 42,
   "simulator": {
-    "task": "Unitree-Go2-Flat-Normal-FixStand-Proprioceptive-Expert",
+    "task": "NORMAL_SIMULATOR_TASK_NAME",
     "device": "cuda:0",
     "gpu_pool": "0",
     "gpu_wrapper": "adapters/run_simulator_stage.sh",
     "environments_per_batch": 1024,
     "source_selection_seed": 10421,
     "rollout_seed_base": 20430,
+    "rollout_actor_arguments": [
+      "--policy_checkpoint",
+      "{rollout_actor_checkpoint}"
+    ],
     "extra_arguments": [
       "--dataset_obs_kind",
       "proprioceptive",

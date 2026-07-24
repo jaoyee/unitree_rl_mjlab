@@ -86,6 +86,7 @@ def main() -> None:
     ]
     assert any("trace_core.rule_score" in command for command in flat_commands)
     assert not any("trace_scorer." in command for command in flat_commands)
+    assert not any("expert" in command.lower() for command in flat_commands)
     collector = next(
         command for command in commands if "--trace_reset_mode" in command.argv
     )

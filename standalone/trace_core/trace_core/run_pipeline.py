@@ -339,6 +339,27 @@ def _collect_commands(
     source_batch_size = environments // branches
     starts = int(candidate["source_start_count"])
     batches = (starts + source_batch_size - 1) // source_batch_size
+    actor_argument_template = tuple(
+        str(item)
+        for item in simulator.get(
+            "rollout_actor_arguments",
+            ["--policy_checkpoint", "{rollout_actor_checkpoint}"],
+        )
+    )
+    actor_arguments = tuple(
+        item.format(
+            rollout_actor_checkpoint=str(baseline.rollout_actor_checkpoint)
+        )
+        for item in actor_argument_template
+    )
+    if not any(
+        str(baseline.rollout_actor_checkpoint) in argument
+        for argument in actor_arguments
+    ):
+        raise ValueError(
+            "simulator.rollout_actor_arguments must include "
+            "{rollout_actor_checkpoint}."
+        )
     commands = [
         Command(
             "collect",
@@ -387,13 +408,7 @@ def _collect_commands(
             environments * int(candidate["horizon"]),
             "--save_path",
             part,
-            "--expert_policy_path",
-            baseline.rollout_actor_checkpoint,
-            "--collector_mix",
-            "expert:1.0",
-            "--fixed_collector_assignment",
-            "--collector_assignment_seed",
-            42,
+            *actor_arguments,
             "--trace_reset_dataset",
             baseline.source_dataset,
             "--trace_reset_mode",

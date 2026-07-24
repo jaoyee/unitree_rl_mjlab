@@ -10,6 +10,9 @@ behavioral contracts.
   command and action histories.
 - Use the baseline actor checkpoint only; do not load an expert actor or
   critic.
+- Map `simulator.rollout_actor_arguments` to the target collector's neutral
+  policy-loading interface. The template value
+  `{rollout_actor_checkpoint}` is always resolved from the baseline adapter.
 - Roll out in the normal simulator with automatic reset disabled.
 - Create all branches for one source from the same realized state, command and
   simulator parameters.

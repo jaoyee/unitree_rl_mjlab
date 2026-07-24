@@ -40,3 +40,7 @@ the rule-selected arm under the new baseline's frozen reward and evaluation.
 
 The scorer ranks behavior. It never changes transition rewards and does not
 decide how actor/critic training is initialized.
+
+For the current from-zero V12 baseline, use the simulator-summary boundary in
+`V12_SUMMARY_ADAPTER.md`. The historical scorer checkpoint is only a candidate
+until it beats the rule-selected and same-size random replay arms on V12.

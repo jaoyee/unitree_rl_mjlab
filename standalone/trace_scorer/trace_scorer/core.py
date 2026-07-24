@@ -203,7 +203,16 @@ class PortableTraceScorer:
     ) -> None:
         """Fail closed when a baseline adapter omits scorer semantics."""
 
-        required = REQUIRED_BEHAVIOR_CONTEXT & set(self.base_feature_names)
+        checkpoint_features = set(self.base_feature_names)
+        missing_checkpoint_semantics = sorted(
+            REQUIRED_BEHAVIOR_CONTEXT - checkpoint_features
+        )
+        if missing_checkpoint_semantics:
+            raise ValueError(
+                "Scorer checkpoint omits required behavior semantics: "
+                f"{missing_checkpoint_semantics}"
+            )
+        required = REQUIRED_BEHAVIOR_CONTEXT
         missing_required: dict[int, list[str]] = {}
         sparse_rows: dict[int, float] = {}
         if max_missing_fraction_per_row is not None and not (
@@ -272,6 +281,12 @@ def load_scorer(
     hidden_dim = int(checkpoint["hidden_dim"])
     stats = dict(checkpoint["feature_stats"])
     base_names = _base_names(stats["names"], input_dim)
+    missing_semantics = sorted(REQUIRED_BEHAVIOR_CONTEXT - set(base_names))
+    if missing_semantics:
+        raise ValueError(
+            "Scorer checkpoint omits required behavior semantics: "
+            f"{missing_semantics}"
+        )
     forbidden = sorted(set(base_names) & FORBIDDEN_REWARD_FEATURES)
     if reject_reward_features and forbidden:
         raise ValueError(

@@ -2,6 +2,7 @@
 
 from .core import (
     FORBIDDEN_REWARD_FEATURES,
+    REQUIRED_BEHAVIOR_CONTEXT,
     PortableTraceScorer,
     ScorerDescriptor,
     load_scorer,
@@ -9,6 +10,7 @@ from .core import (
 
 __all__ = [
     "FORBIDDEN_REWARD_FEATURES",
+    "REQUIRED_BEHAVIOR_CONTEXT",
     "PortableTraceScorer",
     "ScorerDescriptor",
     "load_scorer",

@@ -26,6 +26,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manifest-output", required=True)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--batch-size", type=int, default=8192)
+    parser.add_argument(
+        "--max-missing-fraction-per-row",
+        type=float,
+        default=0.20,
+        help="Fail closed when a row omits too much behavior context.",
+    )
     return parser.parse_args()
 
 
@@ -51,7 +57,11 @@ def main() -> None:
     scorer_path = Path(args.scorer).expanduser().resolve()
     rows = read_jsonl(summary_path)
     scorer = load_scorer(scorer_path, device=args.device, reject_reward_features=True)
-    scores, missing_counts = scorer.score(rows, batch_size=args.batch_size)
+    scores, missing_counts = scorer.score(
+        rows,
+        batch_size=args.batch_size,
+        max_missing_fraction_per_row=args.max_missing_fraction_per_row,
+    )
     scores_output = Path(args.scores_output).expanduser().resolve()
     scores_output.parent.mkdir(parents=True, exist_ok=True)
     temporary_scores = scores_output.with_name(f"{scores_output.name}.tmp.{os.getpid()}")
@@ -88,6 +98,9 @@ def main() -> None:
             "std": float(np.std(scores)) if len(scores) else None,
         },
         "feature_present_counts": present,
+        "maximum_missing_fraction_per_row": float(
+            args.max_missing_fraction_per_row
+        ),
         "baseline_reward_features_rejected": True,
     }
     manifest_output = Path(args.manifest_output).expanduser().resolve()

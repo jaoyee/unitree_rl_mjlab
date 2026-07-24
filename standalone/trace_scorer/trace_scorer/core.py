@@ -22,6 +22,41 @@ FORBIDDEN_REWARD_FEATURES = frozenset(
         "reward_trend_per_second",
     }
 )
+REQUIRED_BEHAVIOR_CONTEXT = frozenset(
+    {
+        "survival_fraction",
+        "terminal_flag",
+        "command_vx_mean",
+        "command_vy_mean",
+        "command_yaw_mean",
+        "command_linear_active",
+        "command_yaw_active",
+        "command_mode_stand",
+        "command_mode_pure_x",
+        "command_mode_pure_y",
+        "command_mode_pure_yaw",
+        "command_mode_xy",
+        "command_mode_x_yaw",
+        "command_mode_y_yaw",
+        "command_mode_xy_yaw",
+        "linear_velocity_realization_ratio_mean",
+        "linear_velocity_realization_ratio_steady",
+        "yaw_velocity_realization_ratio_mean",
+        "yaw_velocity_realization_ratio_steady",
+        "command_direction_violation_rate",
+        "command_direction_correct_fraction",
+        "command_displacement_realization_ratio",
+        "yaw_displacement_realization_ratio",
+        "linear_tracking_error_mean",
+        "linear_tracking_error_steady",
+        "yaw_tracking_error_mean",
+        "yaw_tracking_error_steady",
+        "tilt_mean",
+        "roll_pitch_rate_rms",
+        "action_saturation_fraction",
+        "action_delta_norm_mean",
+    }
+)
 SUPPORTED_FORMATS = frozenset({"go2_trace_scorer_v10_v1"})
 SUPPORTED_FEATURE_SCHEMAS = frozenset({"go2_trace_length_normalized_features_v10"})
 
@@ -133,9 +168,14 @@ class PortableTraceScorer:
         summaries: Sequence[dict[str, Any]],
         *,
         batch_size: int = 8192,
+        max_missing_fraction_per_row: float | None = 0.20,
     ) -> tuple[np.ndarray, dict[str, int]]:
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
+        self.validate_summary_contract(
+            summaries,
+            max_missing_fraction_per_row=max_missing_fraction_per_row,
+        )
         features, missing_counts = self.feature_matrix(summaries)
         output: list[torch.Tensor] = []
         with torch.no_grad():
@@ -154,6 +194,50 @@ class PortableTraceScorer:
         if not np.isfinite(scores).all():
             raise ValueError("Scorer produced non-finite values.")
         return scores, missing_counts
+
+    def validate_summary_contract(
+        self,
+        summaries: Sequence[dict[str, Any]],
+        *,
+        max_missing_fraction_per_row: float | None = 0.20,
+    ) -> None:
+        """Fail closed when a baseline adapter omits scorer semantics."""
+
+        required = REQUIRED_BEHAVIOR_CONTEXT & set(self.base_feature_names)
+        missing_required: dict[int, list[str]] = {}
+        sparse_rows: dict[int, float] = {}
+        if max_missing_fraction_per_row is not None and not (
+            0.0 <= float(max_missing_fraction_per_row) <= 1.0
+        ):
+            raise ValueError("max_missing_fraction_per_row must be in [0, 1].")
+        for index, summary in enumerate(summaries):
+            absent = [
+                name
+                for name in required
+                if self._finite(summary.get(name))[1] > 0.0
+            ]
+            if absent:
+                missing_required[index] = sorted(absent)
+            if max_missing_fraction_per_row is not None:
+                missing = sum(
+                    self._finite(summary.get(name))[1] > 0.0
+                    for name in self.base_feature_names
+                )
+                fraction = missing / max(len(self.base_feature_names), 1)
+                if fraction > float(max_missing_fraction_per_row):
+                    sparse_rows[index] = float(fraction)
+        if missing_required:
+            preview = dict(list(missing_required.items())[:8])
+            raise ValueError(
+                "Trajectory summaries are missing required behavior semantics: "
+                f"{preview}"
+            )
+        if sparse_rows:
+            preview = dict(list(sparse_rows.items())[:8])
+            raise ValueError(
+                "Trajectory summaries exceed the allowed missing-feature fraction: "
+                f"{preview}"
+            )
 
 
 def _base_names(expanded_names: Sequence[str], input_dim: int) -> tuple[str, ...]:

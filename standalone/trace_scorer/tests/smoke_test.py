@@ -23,6 +23,23 @@ def main() -> None:
     assert scorer.descriptor.checkpoint_sha256 == (
         "61df74670b5cef66c11ad76ab4fb95ccaf65607fe130c9e82abe4b88e16e8e34"
     )
+    sparse = {
+        name: 0.0
+        for name in scorer.base_feature_names
+        if name in {
+            "survival_fraction",
+            "terminal_flag",
+            "command_vx_mean",
+            "command_vy_mean",
+            "command_yaw_mean",
+        }
+    }
+    try:
+        scorer.score([sparse])
+    except ValueError as error:
+        assert "behavior semantics" in str(error) or "missing-feature" in str(error)
+    else:
+        raise AssertionError("Sparse scorer input did not fail closed.")
     print("trace_scorer smoke test passed")
 
 

@@ -8,8 +8,9 @@ transition rewards, replay buffer, actor or critic.
 
 The candidate summarizer must provide fields declared by the checkpoint's
 `base_feature_names`. Missing fields are represented by the scorer's explicit
-missingness indicators; they must not be silently replaced by baseline rewards
-or returns.
+missingness indicators, but required behavior context and per-row coverage are
+validated before inference. They must not be silently replaced by baseline
+rewards or returns.
 
 ```python
 from trace_scorer import load_scorer

@@ -7,6 +7,11 @@ reward code. A checkpoint declares its complete feature schema and
 normalization statistics. Loading rejects reward-derived shortcut features by
 default.
 
+Scoring also fails closed when command context, response, survival, posture or
+action-safety semantics are absent, or when more than 20% of one row's
+declared features are missing. This prevents a new baseline adapter from
+silently producing plausible scores from mostly missing inputs.
+
 Public Python API:
 
 ```python
@@ -29,6 +34,9 @@ trace-score \
 The bundled checkpoint is the portable V11.1 seed-44 scorer that passed the
 existing portability/equivalence audit. Its historical name is retained only
 in checkpoint metadata; the runtime module itself is baseline-independent.
+That audit establishes software portability, not downstream effectiveness on a
+new RWM baseline. The checkpoint must still beat a same-size random replay and
+the rule-selected arm under the new baseline's frozen reward and evaluation.
 
 The scorer ranks behavior. It never changes transition rewards and does not
 decide how actor/critic training is initialized.

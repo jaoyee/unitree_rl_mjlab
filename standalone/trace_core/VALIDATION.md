@@ -22,6 +22,8 @@ pure x, pure y, pure yaw and combined modes. Stability is evaluated only after
 the active-component response gate passes. Stand commands use a separate
 stationary-stability profile.
 
-For a No-BLV baseline, true simulator base velocity is permitted only in
-selection summaries and evaluation. It must be zeroed from selected replay
-observations exactly as it is absent from RWM imagination.
+For current V12, true simulator base velocity is used in behavioral selection
+and remains in the 48-dimensional TRACE critic observation. It is not visible
+to the 45-dimensional actor. Before policy training, compare primary-RWM and
+TRACE replay observations with the source-leakage audit, paying particular
+attention to indices `[0, 1, 2]`. Do not zero only the TRACE side.

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -235,6 +236,25 @@ def _replay_commands(
         ),
         "TRACE_REPLAY_REWARD_VERSION": baseline.replay_reward_version or "",
         "TRACE_REPLAY_RECOMPUTE_REWARD_AFTER_SELECTION": "1",
+        "TRACE_REPLAY_OBSERVATION_POLICY": baseline.replay_observation_policy,
+        "TRACE_ACTOR_EXCLUDED_OBSERVATION_INDICES": json.dumps(
+            list(baseline.actor_excluded_observation_indices)
+        ),
+        "TRACE_UNSUPERVISED_RWM_OUTPUT_INDICES": json.dumps(
+            list(baseline.unsupervised_world_model_output_indices)
+        ),
+        "TRACE_SOURCE_LEAKAGE_AUDIT_REQUIRED": (
+            "1" if baseline.source_leakage_audit_required else "0"
+        ),
+        "TRACE_REPLAY_TERMINAL_REWARD_OVERRIDE": (
+            "1" if baseline.replay_terminal_reward_override else "0"
+        ),
+        "TRACE_REPLAY_EPISTEMIC_UNCERTAINTY_MODE": (
+            baseline.replay_epistemic_uncertainty_mode
+        ),
+        "TRACE_REPLAY_ADDITIONAL_REWARD_PENALTIES": (
+            "1" if baseline.replay_additional_reward_penalties else "0"
+        ),
     }
     return [
         Command(
@@ -321,6 +341,18 @@ def _format_training(
         {
             "TRACE_REPLAY_PATH": values["trace_manifest"],
             "TRACE_REPLAY_RATIO": values["trace_replay_ratio"],
+            "TRACE_SOURCE_LEAKAGE_AUDIT_REQUIRED": (
+                "1" if baseline.source_leakage_audit_required else "0"
+            ),
+            "TRACE_POLICY_INITIALIZATION": (
+                baseline.training_policy_initialization
+            ),
+            "TRACE_ACTOR_OBSERVATION_DIM": str(
+                baseline.actor_observation_dim or ""
+            ),
+            "TRACE_CRITIC_OBSERVATION_DIM": str(
+                baseline.critic_observation_dim or ""
+            ),
         }
     )
     return Command("train", argv, environment)
@@ -339,6 +371,7 @@ def _collect_commands(
     source_batch_size = environments // branches
     starts = int(candidate["source_start_count"])
     batches = (starts + source_batch_size - 1) // source_batch_size
+    group_seed_offset = 100_000 * config.candidate_group_index
     actor_argument_template = tuple(
         str(item)
         for item in simulator.get(
@@ -375,7 +408,8 @@ def _collect_commands(
                 "--protocol",
                 config.protocol,
                 "--seed",
-                int(simulator.get("source_selection_seed", 10421)),
+                int(simulator.get("source_selection_seed", 10421))
+                + group_seed_offset,
                 "--batch-output-dir",
                 paths["source_batches"],
                 "--batch-size",
@@ -401,7 +435,9 @@ def _collect_commands(
             "--device",
             str(simulator.get("device", "cuda:0")),
             "--seed",
-            int(simulator.get("rollout_seed_base", 20430)) + batch,
+            int(simulator.get("rollout_seed_base", 20430))
+            + group_seed_offset
+            + batch,
             "--num_envs",
             environments,
             "--num_transitions",
@@ -484,6 +520,31 @@ def _collect_commands(
 def build_commands(
     config: PipelineConfig, baseline: BaselineAdapter
 ) -> tuple[dict[str, Path], list[Command]]:
+    if not 0 <= config.candidate_group_index < baseline.candidate_resample_groups:
+        raise ValueError(
+            "pipeline.candidate_group_index must be in "
+            f"[0, {baseline.candidate_resample_groups - 1}]."
+        )
+    protocol_replay = dict(_protocol(config).get("replay") or {})
+    if (
+        baseline.replay_n_step is not None
+        and int(protocol_replay.get("n_step", -1)) != baseline.replay_n_step
+    ):
+        raise ValueError(
+            "Protocol replay.n_step differs from the frozen baseline adapter."
+        )
+    if (
+        baseline.replay_gamma is not None
+        and not math.isclose(
+            float(protocol_replay.get("gamma", float("nan"))),
+            baseline.replay_gamma,
+            rel_tol=0.0,
+            abs_tol=1.0e-12,
+        )
+    ):
+        raise ValueError(
+            "Protocol replay.gamma differs from the frozen baseline adapter."
+        )
     paths = _paths(config)
     commands = _collect_commands(config, baseline, paths)
     commands.append(_summary_command(config, baseline, paths))
@@ -555,12 +616,44 @@ def _write_manifest(
             ),
             "candidate_simulator": baseline.candidate_simulator,
             "candidate_reset_mode": baseline.candidate_reset_mode,
+            "candidate_resample_groups": baseline.candidate_resample_groups,
+            "candidate_group_index": config.candidate_group_index,
+            "candidate_rollout_policy_source": (
+                baseline.candidate_rollout_policy_source
+            ),
+            "observation_full_dim": baseline.observation_full_dim,
+            "actor_observation_dim": baseline.actor_observation_dim,
+            "critic_observation_dim": baseline.critic_observation_dim,
+            "actor_excluded_observation_indices": list(
+                baseline.actor_excluded_observation_indices
+            ),
+            "unsupervised_world_model_output_indices": list(
+                baseline.unsupervised_world_model_output_indices
+            ),
+            "replay_observation_policy": baseline.replay_observation_policy,
+            "source_leakage_audit_required": (
+                baseline.source_leakage_audit_required
+            ),
             "replay_zero_observation_indices": list(
                 baseline.replay_zero_observation_indices
             ),
             "replay_reward_version": baseline.replay_reward_version,
             "replay_recompute_reward_after_selection": (
                 baseline.replay_recompute_reward_after_selection
+            ),
+            "replay_n_step": baseline.replay_n_step,
+            "replay_gamma": baseline.replay_gamma,
+            "replay_terminal_reward_override": (
+                baseline.replay_terminal_reward_override
+            ),
+            "replay_epistemic_uncertainty_mode": (
+                baseline.replay_epistemic_uncertainty_mode
+            ),
+            "replay_additional_reward_penalties": (
+                baseline.replay_additional_reward_penalties
+            ),
+            "training_policy_initialization": (
+                baseline.training_policy_initialization
             ),
         },
         "trace": {

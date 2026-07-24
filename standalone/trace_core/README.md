@@ -35,6 +35,7 @@ This is intentional: simulator reset, candidate collection and reward
 materialization stay behind configured adapter tools.
 The exact collector/summary/replay/trainer requirements are documented in
 `ADAPTER_CONTRACT.md`; the staged five-group experiment is in `VALIDATION.md`.
+The audited current-V12 bridge points are listed in `V12_ADAPTATION.md`.
 
 The first validation should use `"selection": {"backend": "rule"}`.  The hard
 eligibility tier first requires every active command component to respond.
@@ -43,8 +44,8 @@ Within eligible candidates, weakest-component tracking/response contributes
 downstream gain over a same-size random replay, switch only the backend to
 `scorer` and provide a scorer checkpoint.
 
-For a No-BLV baseline, start from
-`v12_noblv_baseline_adapter.template.json`.  True simulator base velocity may
-be used in behavioral summaries, but indices `[0, 1, 2]` are zeroed when the
-selected transitions are materialized so the critic cannot identify the data
-source from a feature unavailable in RWM imagination.
+For the current 42-to-45 V12 baseline, start from
+`v12_current_baseline_adapter.template.json`. Its actor excludes base linear
+velocity but its critic and reward do not. The template therefore preserves
+native 48-dimensional replay observations and requires a source-leakage audit
+instead of incorrectly zeroing only TRACE rows.

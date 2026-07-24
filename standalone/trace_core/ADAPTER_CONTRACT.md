@@ -48,14 +48,25 @@ motion from passing an `x+yaw` or `x+y` command.
   environment. Refuse to materialize replay if these constraints cannot be
   honored.
 
-For the V12 No-BLV route, simulator base velocity is retained in summaries but
-observation indices `[0, 1, 2]` are zeroed in both replay observations before
-training. This matches RWM imagination and prevents the critic from detecting
-the replay source.
+The current V12 route is asymmetric rather than fully No-BLV: the actor drops
+base linear velocity `[0, 1, 2]`, while the critic consumes all 48 observation
+coordinates. The world model does not consume or supervise those state
+coordinates but still emits nonzero predictions, and the frozen
+`v1_1_dense_progress` reward reads them.
+
+Therefore V12 TRACE must not zero `[0, 1, 2]` only in the secondary replay.
+The initial adapter uses `source_native_full_state`: physical simulator
+velocity in TRACE replay and native RWM output in primary replay. Because this
+can reveal replay source to the critic, a source-leakage audit is mandatory
+before training. Any later projection policy must be compared as an explicit
+ablation, not silently substituted.
 
 ## Trainer adapter
 
-The trainer mixes the selected replay at the configured batch fraction. The
-baseline and TRACE arms start from the same frozen policy/critic/optimizer
-state. A same-size random replay arm uses the same candidate pool, command
-distribution, reward materializer and transition count.
+The trainer mixes the selected replay at the configured batch fraction. For
+the current V12 protocol, baseline, random-TRACE and selected-TRACE arms all
+initialize actor, critic, target critic, temperature and optimizers from zero
+with matched seeds. The frozen baseline actor checkpoint is used only to
+generate candidate rollouts. A same-size random replay arm uses the same
+candidate pool, command distribution, reward materializer and transition
+count.

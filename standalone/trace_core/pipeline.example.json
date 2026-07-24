@@ -10,6 +10,7 @@
   "output_root": "/absolute/path/to/trace_run",
   "refresh_cycle": 1,
   "seed": 42,
+  "candidate_group_index": 0,
   "simulator": {
     "task": "NORMAL_SIMULATOR_TASK_NAME",
     "device": "cuda:0",

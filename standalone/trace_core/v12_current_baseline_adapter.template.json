@@ -1,0 +1,49 @@
+{
+  "schema": "trace_baseline_adapter_v2",
+  "name": "v12_SIZE_CONDITION_5m_no_bc",
+  "setting": "sim",
+  "source_dataset": "/absolute/path/to/v12/CONDITION/selected_SIZE/dataset.pt",
+  "rollout_actor_checkpoint": "/absolute/path/to/selected/v12/policy/checkpoint",
+  "reward_config": "/absolute/path/to/selected/v12/rwm_flashsac_config.yaml",
+  "world_model_checkpoint": "/absolute/path/to/selected/v12/model_5000.pt",
+  "candidate": {
+    "simulator": "normal",
+    "reset_mode": "exact_snapshot",
+    "resample_groups": 5,
+    "rollout_policy_source": "baseline_actor_checkpoint"
+  },
+  "observation": {
+    "full_dim": 48,
+    "actor_dim": 45,
+    "critic_dim": 48,
+    "actor_excluded_indices": [0, 1, 2],
+    "unsupervised_world_model_output_indices": [0, 1, 2]
+  },
+  "replay": {
+    "reward_version": "v1_1_dense_progress",
+    "recompute_reward_after_selection": true,
+    "n_step": 3,
+    "gamma": 0.99,
+    "terminal_reward_override": false,
+    "observation_policy": "source_native_full_state",
+    "zero_observation_indices": [],
+    "source_leakage_audit_required": true,
+    "epistemic_uncertainty_mode": "physical_zero",
+    "additional_reward_penalties": false
+  },
+  "training": {
+    "policy_initialization": "from_zero",
+    "initial_checkpoint": null,
+    "command": [
+      "bash",
+      "/absolute/path/to/v12_trace_from_zero_entrypoint.sh"
+    ],
+    "environment": {
+      "DATASET_PATH": "{source_dataset}",
+      "MODEL_PATH": "{world_model_checkpoint}",
+      "OUTPUT_DIR": "{output_root}",
+      "TRACE_REPLAY_MANIFEST": "{trace_manifest}",
+      "TRACE_REPLAY_RATIO": "{trace_replay_ratio}"
+    }
+  }
+}

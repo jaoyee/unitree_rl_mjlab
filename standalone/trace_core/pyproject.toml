@@ -4,14 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trace-core"
-version = "0.1.0"
+version = "0.2.0"
 description = "Baseline-agnostic TRACE orchestration and adapter contracts"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = ["numpy>=1.24"]
 
 [project.scripts]
 trace-run = "trace_core.run_pipeline:main"
 trace-annotate-eligibility = "trace_core.annotate_eligibility:main"
+trace-rule-score = "trace_core.rule_score:main"
+trace-export-selection = "trace_core.export_selection_manifest:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

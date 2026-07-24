@@ -127,39 +127,63 @@ def _eligibility_command(
 def _selection_commands(
     config: PipelineConfig, baseline: BaselineAdapter, paths: dict[str, Path]
 ) -> list[Command]:
+    if config.selection_backend == "rule":
+        scoring = [
+            Command(
+                "score",
+                (
+                    str(config.python),
+                    "-m",
+                    "trace_core.rule_score",
+                    "--summaries",
+                    paths["summaries"],
+                    "--scores-output",
+                    paths["scores"],
+                    "--manifest-output",
+                    paths["score_manifest"],
+                    "--scored-summaries-output",
+                    paths["scored_summaries"],
+                ),
+            )
+        ]
+    else:
+        assert config.scorer_checkpoint is not None
+        scoring = [
+            Command(
+                "score",
+                (
+                    str(config.python),
+                    "-m",
+                    "trace_scorer.score_candidates",
+                    "--summaries",
+                    paths["summaries"],
+                    "--scorer",
+                    config.scorer_checkpoint,
+                    "--scores-output",
+                    paths["scores"],
+                    "--manifest-output",
+                    paths["score_manifest"],
+                ),
+            ),
+            Command(
+                "select",
+                (
+                    str(config.python),
+                    "-m",
+                    "trace_scorer.attach_scores",
+                    "--summaries",
+                    paths["summaries"],
+                    "--scores",
+                    paths["scores"],
+                    "--score-manifest",
+                    paths["score_manifest"],
+                    "--output",
+                    paths["scored_summaries"],
+                ),
+            ),
+        ]
     return [
-        Command(
-            "score",
-            (
-                str(config.python),
-                "-m",
-                "trace_scorer.score_candidates",
-                "--summaries",
-                paths["summaries"],
-                "--scorer",
-                config.scorer_checkpoint,
-                "--scores-output",
-                paths["scores"],
-                "--manifest-output",
-                paths["score_manifest"],
-            ),
-        ),
-        Command(
-            "select",
-            (
-                str(config.python),
-                "-m",
-                "trace_scorer.attach_scores",
-                "--summaries",
-                paths["summaries"],
-                "--scores",
-                paths["scores"],
-                "--score-manifest",
-                paths["score_manifest"],
-                "--output",
-                paths["scored_summaries"],
-            ),
-        ),
+        *scoring,
         Command(
             "select",
             _python(
@@ -182,7 +206,7 @@ def _selection_commands(
             (
                 str(config.python),
                 "-m",
-                "trace_scorer.export_selection_manifest",
+                "trace_core.export_selection_manifest",
                 "--summaries",
                 paths["summaries"],
                 "--scores",
@@ -205,6 +229,13 @@ def _replay_commands(
 ) -> list[Command]:
     protocol = _protocol(config)
     ratio = protocol["candidate"]["selection_ratio"]
+    replay_environment = {
+        "TRACE_REPLAY_ZERO_OBSERVATION_INDICES": json.dumps(
+            list(baseline.replay_zero_observation_indices)
+        ),
+        "TRACE_REPLAY_REWARD_VERSION": baseline.replay_reward_version or "",
+        "TRACE_REPLAY_RECOMPUTE_REWARD_AFTER_SELECTION": "1",
+    }
     return [
         Command(
             "replay",
@@ -240,6 +271,7 @@ def _replay_commands(
                 "--summary_jsonl",
                 paths["replay_summaries"],
             ),
+            replay_environment,
         ),
         Command(
             "replay",
@@ -365,7 +397,7 @@ def _collect_commands(
             "--trace_reset_dataset",
             baseline.source_dataset,
             "--trace_reset_mode",
-            "exact_snapshot",
+            baseline.candidate_reset_mode,
             "--trace_source_ids_path",
             source_batch,
             "--trace_min_source_timestep",
@@ -453,12 +485,13 @@ def _preflight(config: PipelineConfig, baseline: BaselineAdapter) -> None:
     required = [
         config.python,
         config.protocol,
-        config.scorer_checkpoint,
         baseline.source_dataset,
         baseline.rollout_actor_checkpoint,
         baseline.reward_config,
         *config.tools.values(),
     ]
+    if config.scorer_checkpoint is not None:
+        required.append(config.scorer_checkpoint)
     if baseline.world_model_checkpoint is not None:
         required.append(baseline.world_model_checkpoint)
     missing = [str(path) for path in required if not path.exists()]
@@ -505,18 +538,40 @@ def _write_manifest(
                 if baseline.training_initial_checkpoint
                 else None
             ),
+            "candidate_simulator": baseline.candidate_simulator,
+            "candidate_reset_mode": baseline.candidate_reset_mode,
+            "replay_zero_observation_indices": list(
+                baseline.replay_zero_observation_indices
+            ),
+            "replay_reward_version": baseline.replay_reward_version,
+            "replay_recompute_reward_after_selection": (
+                baseline.replay_recompute_reward_after_selection
+            ),
         },
         "trace": {
             "protocol": str(config.protocol),
             "protocol_sha256": _sha256(config.protocol),
-            "scorer_checkpoint": str(config.scorer_checkpoint),
-            "scorer_checkpoint_sha256": _sha256(config.scorer_checkpoint),
+            "selection_backend": config.selection_backend,
+            "scorer_checkpoint": (
+                str(config.scorer_checkpoint)
+                if config.scorer_checkpoint is not None
+                else None
+            ),
+            "scorer_checkpoint_sha256": (
+                _sha256(config.scorer_checkpoint)
+                if config.scorer_checkpoint is not None
+                else None
+            ),
             "simulator_is_upstream": True,
             "summary_reward_source": "ignored_by_scorer",
             "replay_reward_source": "baseline_adapter",
         },
         "commands": [
-            {"stage": command.stage, "argv": list(command.argv)}
+            {
+                "stage": command.stage,
+                "argv": [str(value) for value in command.argv],
+                "environment": command.environment or {},
+            }
             for command in commands
         ],
         "artifacts": {name: str(path) for name, path in paths.items()},
@@ -557,7 +612,11 @@ def main() -> None:
                     "baseline": baseline.name,
                     "stages": requested,
                     "commands": [
-                        {"stage": row.stage, "argv": list(row.argv)}
+                        {
+                            "stage": row.stage,
+                            "argv": [str(value) for value in row.argv],
+                            "environment": row.environment or {},
+                        }
                         for row in selected
                     ],
                     "pipeline_manifest": str(paths["pipeline_manifest"]),
@@ -573,14 +632,18 @@ def main() -> None:
         else:
             path.parent.mkdir(parents=True, exist_ok=True)
     for command in selected:
-        print(f"[TRACE:{command.stage}] {' '.join(command.argv)}", flush=True)
+        print(
+            f"[TRACE:{command.stage}] "
+            f"{' '.join(str(value) for value in command.argv)}",
+            flush=True,
+        )
         if command.argv[0] == "__copy__":
             shutil.copy2(command.argv[1], command.argv[2])
             continue
         environment = os.environ.copy()
         environment.update(command.environment or {})
         subprocess.run(
-            command.argv,
+            tuple(str(value) for value in command.argv),
             cwd=config.repo_root,
             env=environment,
             check=True,

@@ -1,0 +1,32 @@
+{
+  "schema": "trace_baseline_adapter_v1",
+  "name": "v12_noblv_replace_after_baseline_selection",
+  "setting": "sim",
+  "source_dataset": "/absolute/path/to/v12/CONDITION/selected_SIZE/dataset.pt",
+  "rollout_actor_checkpoint": "/absolute/path/to/selected/v12/policy/checkpoint",
+  "reward_config": "/absolute/path/to/selected/v12/rwm_flashsac_config.yaml",
+  "world_model_checkpoint": "/absolute/path/to/selected/v12/model_5000.pt",
+  "candidate": {
+    "simulator": "normal",
+    "reset_mode": "exact_snapshot"
+  },
+  "replay": {
+    "reward_version": "v1_1_dense_progress_noblv",
+    "recompute_reward_after_selection": true,
+    "zero_observation_indices": [0, 1, 2]
+  },
+  "training": {
+    "initial_checkpoint": "/absolute/path/to/the/same/frozen/v12/policy/checkpoint",
+    "command": [
+      "bash",
+      "/absolute/path/to/v12_trace_continuation_entrypoint.sh"
+    ],
+    "environment": {
+      "DATASET_PATH": "{source_dataset}",
+      "MODEL_PATH": "{world_model_checkpoint}",
+      "OUTPUT_DIR": "{output_root}",
+      "TRACE_REPLAY_MANIFEST": "{trace_manifest}",
+      "TRACE_REPLAY_RATIO": "{trace_replay_ratio}"
+    }
+  }
+}

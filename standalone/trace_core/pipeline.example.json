@@ -3,7 +3,10 @@
   "repo_root": "/absolute/path/to/target_project",
   "python": ".venv/bin/python",
   "protocol": "/absolute/path/to/trace_core/protocol.json",
-  "scorer_checkpoint": "/absolute/path/to/trace_scorer/checkpoints/scorer.pt",
+  "selection": {
+    "backend": "rule",
+    "scorer_checkpoint": null
+  },
   "output_root": "/absolute/path/to/trace_run",
   "refresh_cycle": 1,
   "seed": 42,

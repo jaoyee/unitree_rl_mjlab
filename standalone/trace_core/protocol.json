@@ -40,6 +40,7 @@
     "milp_relative_gap": 0.0
   },
   "validity": {
+    "minimum_component_realization_ratio": 0.10,
     "minimum_linear_realization_ratio": 0.10,
     "minimum_yaw_realization_ratio": 0.10,
     "minimum_linear_net_displacement": 0.001,
@@ -47,7 +48,7 @@
     "maximum_direction_violation_rate": 0.50,
     "action_saturation_threshold": 0.95,
     "maximum_saturation_fraction": 0.50,
-    "maximum_reset_reconstruction_error": 0.005,
+    "maximum_reset_reconstruction_error": 0.0001,
     "minimum_terminal_length": 20
   },
   "scorer": {

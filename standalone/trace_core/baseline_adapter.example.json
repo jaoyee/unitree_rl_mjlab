@@ -6,6 +6,15 @@
   "rollout_actor_checkpoint": "/absolute/path/to/checkpoint",
   "reward_config": "/absolute/path/to/baseline_reward_config.yaml",
   "world_model_checkpoint": "/absolute/path/to/world_model.pt",
+  "candidate": {
+    "simulator": "normal",
+    "reset_mode": "exact_snapshot"
+  },
+  "replay": {
+    "reward_version": null,
+    "recompute_reward_after_selection": true,
+    "zero_observation_indices": []
+  },
   "training": {
     "initial_checkpoint": null,
     "command": [

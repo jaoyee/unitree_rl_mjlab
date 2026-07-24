@@ -40,6 +40,11 @@ class BaselineAdapter:
     rollout_actor_checkpoint: Path
     reward_config: Path
     world_model_checkpoint: Path | None
+    candidate_simulator: str
+    candidate_reset_mode: str
+    replay_zero_observation_indices: tuple[int, ...]
+    replay_reward_version: str | None
+    replay_recompute_reward_after_selection: bool
     training_initial_checkpoint: Path | None
     training_command: tuple[str, ...]
     training_environment: dict[str, str]
@@ -49,9 +54,41 @@ class BaselineAdapter:
         if document.get("schema") != "trace_baseline_adapter_v1":
             raise ValueError("Baseline adapter schema must be trace_baseline_adapter_v1.")
         training = dict(document.get("training") or {})
+        candidate = dict(document.get("candidate") or {})
+        replay = dict(document.get("replay") or {})
         setting = str(document.get("setting", "sim"))
         if setting not in {"sim", "real"}:
             raise ValueError("Baseline adapter setting must be sim or real.")
+        candidate_simulator = str(candidate.get("simulator", "normal"))
+        if candidate_simulator != "normal":
+            raise ValueError(
+                "Portable TRACE candidates must be collected in the normal simulator."
+            )
+        expected_reset_mode = (
+            "exact_snapshot" if setting == "sim" else "canonical_real_projection"
+        )
+        candidate_reset_mode = str(
+            candidate.get("reset_mode", expected_reset_mode)
+        )
+        if candidate_reset_mode != expected_reset_mode:
+            raise ValueError(
+                f"Portable TRACE requires candidate.reset_mode="
+                f"{expected_reset_mode} for setting={setting}."
+            )
+        recompute_reward = bool(
+            replay.get("recompute_reward_after_selection", True)
+        )
+        if not recompute_reward:
+            raise ValueError(
+                "TRACE replay reward must be recomputed after selection."
+            )
+        zero_indices = tuple(
+            int(value) for value in replay.get("zero_observation_indices", [])
+        )
+        if any(index < 0 for index in zero_indices):
+            raise ValueError("Replay zero_observation_indices must be non-negative.")
+        if len(zero_indices) != len(set(zero_indices)):
+            raise ValueError("Replay zero_observation_indices must be unique.")
         return cls(
             name=str(_required(document, "name")),
             setting=setting,
@@ -61,6 +98,15 @@ class BaselineAdapter:
             ),
             reward_config=_resolve(base, str(_required(document, "reward_config"))),
             world_model_checkpoint=_resolve(base, document.get("world_model_checkpoint")),
+            candidate_simulator=candidate_simulator,
+            candidate_reset_mode=candidate_reset_mode,
+            replay_zero_observation_indices=zero_indices,
+            replay_reward_version=(
+                str(replay["reward_version"])
+                if replay.get("reward_version") is not None
+                else None
+            ),
+            replay_recompute_reward_after_selection=recompute_reward,
             training_initial_checkpoint=_resolve(
                 base, training.get("initial_checkpoint")
             ),
@@ -77,7 +123,8 @@ class PipelineConfig:
     repo_root: Path
     python: Path
     protocol: Path
-    scorer_checkpoint: Path
+    selection_backend: str
+    scorer_checkpoint: Path | None
     output_root: Path
     refresh_cycle: int
     seed: int
@@ -105,6 +152,17 @@ class PipelineConfig:
         missing = sorted(required_tools - tools.keys())
         if missing:
             raise ValueError(f"Pipeline tool mapping is incomplete: {missing}")
+        selection = dict(document.get("selection") or {})
+        selection_backend = str(selection.get("backend", "scorer"))
+        if selection_backend not in {"rule", "scorer"}:
+            raise ValueError("Selection backend must be rule or scorer.")
+        scorer_value = selection.get(
+            "scorer_checkpoint", document.get("scorer_checkpoint")
+        )
+        if selection_backend == "scorer" and not scorer_value:
+            raise ValueError(
+                "A scorer checkpoint is required when selection.backend=scorer."
+            )
         return cls(
             repo_root=repo_root,
             # Resolving the final symlink of a virtualenv Python turns it into
@@ -113,8 +171,11 @@ class PipelineConfig:
                 repo_root, str(_required(document, "python"))
             ),
             protocol=_resolve(repo_root, str(_required(document, "protocol"))),
-            scorer_checkpoint=_resolve(
-                repo_root, str(_required(document, "scorer_checkpoint"))
+            selection_backend=selection_backend,
+            scorer_checkpoint=(
+                _resolve(repo_root, str(scorer_value))
+                if scorer_value is not None
+                else None
             ),
             output_root=_resolve(base, str(_required(document, "output_root"))),
             refresh_cycle=int(document.get("refresh_cycle", 1)),

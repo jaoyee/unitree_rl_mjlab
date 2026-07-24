@@ -8,7 +8,8 @@ Stages:
 2. collect multiple normal-simulator branches from exact snapshots;
 3. summarize behavioral tracking and motion stability;
 4. apply reset/finite/action/response eligibility gates;
-5. call the separately installed `trace-scorer`;
+5. rank with either the built-in motion-first rule selector or the separately
+   installed `trace-scorer`;
 6. apply command-distribution selection;
 7. export an immutable selection manifest;
 8. rebuild replay using the baseline adapter's reward;
@@ -32,3 +33,18 @@ trace-run \
 The package contains orchestration and contracts, not a robot implementation.
 This is intentional: simulator reset, candidate collection and reward
 materialization stay behind configured adapter tools.
+The exact collector/summary/replay/trainer requirements are documented in
+`ADAPTER_CONTRACT.md`; the staged five-group experiment is in `VALIDATION.md`.
+
+The first validation should use `"selection": {"backend": "rule"}`.  The hard
+eligibility tier first requires every active command component to respond.
+Within eligible candidates, weakest-component tracking/response contributes
+70% and command-conditional stability contributes 30%.  After this produces a
+downstream gain over a same-size random replay, switch only the backend to
+`scorer` and provide a scorer checkpoint.
+
+For a No-BLV baseline, start from
+`v12_noblv_baseline_adapter.template.json`.  True simulator base velocity may
+be used in behavioral summaries, but indices `[0, 1, 2]` are zeroed when the
+selected transitions are materialized so the critic cannot identify the data
+source from a feature unavailable in RWM imagination.
